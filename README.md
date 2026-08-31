@@ -2,6 +2,8 @@
 
 <p align="center">Typed Rust library, CLI tools, GUI monitor, and Python bindings for the ChargerLAB POWER-Z KM003C USB-C power analyzer.</p>
 
+简体中文：[README.zh-CN.md](README.zh-CN.md)
+
 <p align="center">
   <a href="https://crates.io/crates/km003c-lib"><img alt="crates.io" src="https://img.shields.io/crates/v/km003c-lib.svg"></a>
   <a href="https://docs.rs/km003c-lib"><img alt="docs.rs" src="https://img.shields.io/docsrs/km003c-lib"></a>
