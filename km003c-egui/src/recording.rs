@@ -2,18 +2,18 @@ use std::error::Error;
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 
 use polars::df;
 use polars::prelude::{CsvWriter, DataFrame, KeyValueMetadata, ParquetWriter, SerWriter};
+use serde::{Deserialize, Serialize};
 
 use crate::measurement::MeasurementSample;
 pub(crate) const RECORDING_SCHEMA_VERSION: &str = "1";
 const ROW_GROUP_SIZE: usize = 8_192;
-const CHANNEL_CAPACITY: usize = 32;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum RecordingFormat {
     Parquet,
     Csv,
@@ -37,7 +37,7 @@ impl RecordingFormat {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RecordingMetadata {
     pub(crate) model: String,
     pub(crate) firmware: String,
@@ -54,6 +54,19 @@ struct RecordingOrigin {
     cumulative_missing_samples: u64,
     cumulative_interpolated_duration_us: u64,
     cumulative_discarded_sequence_samples: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub(crate) struct RecordingOffsets {
+    pub(crate) elapsed_us: u64,
+    pub(crate) sample_index: u64,
+    pub(crate) charge_uah: f64,
+    pub(crate) energy_uwh: f64,
+    pub(crate) charge_throughput_uah: f64,
+    pub(crate) energy_throughput_uwh: f64,
+    pub(crate) cumulative_missing_samples: u64,
+    pub(crate) cumulative_interpolated_duration_us: u64,
+    pub(crate) cumulative_discarded_sequence_samples: u64,
 }
 
 impl From<Option<MeasurementSample>> for RecordingOrigin {
@@ -80,6 +93,34 @@ impl From<Option<MeasurementSample>> for RecordingOrigin {
                 cumulative_discarded_sequence_samples: sample.cumulative_discarded_sequence_samples,
             },
         )
+    }
+}
+
+impl RecordingOrigin {
+    #[cfg(test)]
+    fn rebase_after_pause(&mut self, paused: MeasurementSample, resumed: MeasurementSample) {
+        self.elapsed_us = self
+            .elapsed_us
+            .saturating_add(resumed.elapsed_us.saturating_sub(paused.elapsed_us));
+        self.charge_uah += resumed.charge_uah - paused.charge_uah;
+        self.energy_uwh += resumed.energy_uwh - paused.energy_uwh;
+        self.charge_throughput_uah += resumed.charge_throughput_uah - paused.charge_throughput_uah;
+        self.energy_throughput_uwh += resumed.energy_throughput_uwh - paused.energy_throughput_uwh;
+        self.cumulative_missing_samples = self.cumulative_missing_samples.saturating_add(
+            resumed
+                .cumulative_missing_samples
+                .saturating_sub(paused.cumulative_missing_samples),
+        );
+        self.cumulative_interpolated_duration_us = self.cumulative_interpolated_duration_us.saturating_add(
+            resumed
+                .cumulative_interpolated_duration_us
+                .saturating_sub(paused.cumulative_interpolated_duration_us),
+        );
+        self.cumulative_discarded_sequence_samples = self.cumulative_discarded_sequence_samples.saturating_add(
+            resumed
+                .cumulative_discarded_sequence_samples
+                .saturating_sub(paused.cumulative_discarded_sequence_samples),
+        );
     }
 }
 
@@ -111,9 +152,16 @@ struct RecordingRow {
 }
 
 impl RecordingRow {
-    fn from_sample(sample: MeasurementSample, origin: RecordingOrigin, sample_index: u64) -> Self {
+    fn from_sample(
+        sample: MeasurementSample,
+        origin: RecordingOrigin,
+        offsets: RecordingOffsets,
+        sample_index: u64,
+    ) -> Self {
         Self {
-            elapsed_us: sample.elapsed_us.saturating_sub(origin.elapsed_us),
+            elapsed_us: offsets
+                .elapsed_us
+                .saturating_add(sample.elapsed_us.saturating_sub(origin.elapsed_us)),
             sample_index,
             sequence: u32::from(sample.sequence),
             marker: u32::from(sample.marker),
@@ -121,23 +169,31 @@ impl RecordingRow {
             missing_samples: u32::from(sample.missing_samples),
             gap_duration_us: sample.gap_duration_us,
             interpolated: sample.interpolated,
-            cumulative_missing_samples: sample
-                .cumulative_missing_samples
-                .saturating_sub(origin.cumulative_missing_samples),
-            cumulative_interpolated_duration_us: sample
-                .cumulative_interpolated_duration_us
-                .saturating_sub(origin.cumulative_interpolated_duration_us),
+            cumulative_missing_samples: offsets.cumulative_missing_samples.saturating_add(
+                sample
+                    .cumulative_missing_samples
+                    .saturating_sub(origin.cumulative_missing_samples),
+            ),
+            cumulative_interpolated_duration_us: offsets.cumulative_interpolated_duration_us.saturating_add(
+                sample
+                    .cumulative_interpolated_duration_us
+                    .saturating_sub(origin.cumulative_interpolated_duration_us),
+            ),
             discarded_sequence_samples: sample.discarded_sequence_samples,
-            cumulative_discarded_sequence_samples: sample
-                .cumulative_discarded_sequence_samples
-                .saturating_sub(origin.cumulative_discarded_sequence_samples),
+            cumulative_discarded_sequence_samples: offsets.cumulative_discarded_sequence_samples.saturating_add(
+                sample
+                    .cumulative_discarded_sequence_samples
+                    .saturating_sub(origin.cumulative_discarded_sequence_samples),
+            ),
             vbus_uv: sample.vbus_uv,
             ibus_ua: sample.ibus_ua,
             power_uw: sample.power_uw,
-            charge_uah: sample.charge_uah - origin.charge_uah,
-            energy_uwh: sample.energy_uwh - origin.energy_uwh,
-            charge_throughput_uah: sample.charge_throughput_uah - origin.charge_throughput_uah,
-            energy_throughput_uwh: sample.energy_throughput_uwh - origin.energy_throughput_uwh,
+            charge_uah: offsets.charge_uah + sample.charge_uah - origin.charge_uah,
+            energy_uwh: offsets.energy_uwh + sample.energy_uwh - origin.energy_uwh,
+            charge_throughput_uah: offsets.charge_throughput_uah + sample.charge_throughput_uah
+                - origin.charge_throughput_uah,
+            energy_throughput_uwh: offsets.energy_throughput_uwh + sample.energy_throughput_uwh
+                - origin.energy_throughput_uwh,
             cc1_uv: sample.cc1_uv,
             cc2_uv: sample.cc2_uv,
             dp_uv: sample.dp_uv,
@@ -166,6 +222,10 @@ pub(crate) struct RecordingSummary {
     pub(crate) missing_samples: u64,
     pub(crate) interpolated_duration_us: u64,
     pub(crate) discarded_sequence_samples: u64,
+    pub(crate) charge_uah: f64,
+    pub(crate) energy_uwh: f64,
+    pub(crate) charge_throughput_uah: f64,
+    pub(crate) energy_throughput_uwh: f64,
 }
 
 impl RecordingSummary {
@@ -179,10 +239,11 @@ impl RecordingSummary {
 }
 
 pub(crate) struct Recorder {
-    command_tx: SyncSender<WriterCommand>,
+    command_tx: Sender<WriterCommand>,
     event_rx: Receiver<RecordingEvent>,
     handle: Option<JoinHandle<()>>,
     origin: RecordingOrigin,
+    offsets: RecordingOffsets,
     next_sample_index: u64,
     finishing: bool,
     interrupted: Option<String>,
@@ -192,6 +253,10 @@ pub(crate) struct Recorder {
     pub(crate) missing_samples: u64,
     pub(crate) interpolated_duration_us: u64,
     pub(crate) discarded_sequence_samples: u64,
+    pub(crate) charge_uah: f64,
+    pub(crate) energy_uwh: f64,
+    pub(crate) charge_throughput_uah: f64,
+    pub(crate) energy_throughput_uwh: f64,
 }
 
 impl Recorder {
@@ -201,19 +266,35 @@ impl Recorder {
         metadata: RecordingMetadata,
         origin: Option<MeasurementSample>,
     ) -> Result<Self, String> {
+        Self::start_with_offsets(path, format, metadata, origin, RecordingOffsets::default())
+    }
+
+    pub(crate) fn start_with_offsets(
+        path: PathBuf,
+        format: RecordingFormat,
+        metadata: RecordingMetadata,
+        origin: Option<MeasurementSample>,
+        offsets: RecordingOffsets,
+    ) -> Result<Self, String> {
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         if !parent.exists() {
             return Err(format!("output directory does not exist: {}", parent.display()));
         }
 
         let partial_path = partial_path(&path);
-        let (command_tx, command_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        // The USB/UI bridge can deliver a short burst of queued samples after
+        // macOS unlocks the display. A bounded writer channel used to reject
+        // that perfectly valid catch-up burst and left the UI in a half-paused
+        // state. The upstream USB channel is already lossless and unbounded,
+        // so keep the recording hand-off lossless as well; row-group batching
+        // in the writer still bounds the amount processed per write.
+        let (command_tx, command_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
         let final_path = path.clone();
         let handle = thread::Builder::new()
             .name("km003c-recorder".to_string())
             .spawn(move || {
-                let result = run_writer(&partial_path, format, metadata, command_rx).and_then(|summary| {
+                let result = run_writer(&partial_path, format, metadata, offsets, command_rx).and_then(|summary| {
                     replace_file(&partial_path, &final_path)?;
                     Ok(RecordingSummary {
                         path: final_path,
@@ -236,21 +317,29 @@ impl Recorder {
             event_rx,
             handle: Some(handle),
             origin: origin.into(),
-            next_sample_index: 0,
+            offsets,
+            next_sample_index: offsets.sample_index,
             finishing: false,
             interrupted: None,
             path,
-            rows: 0,
-            elapsed_us: 0,
-            missing_samples: 0,
-            interpolated_duration_us: 0,
-            discarded_sequence_samples: 0,
+            rows: offsets.sample_index,
+            elapsed_us: offsets.elapsed_us,
+            missing_samples: offsets.cumulative_missing_samples,
+            interpolated_duration_us: offsets.cumulative_interpolated_duration_us,
+            discarded_sequence_samples: offsets.cumulative_discarded_sequence_samples,
+            charge_uah: offsets.charge_uah,
+            energy_uwh: offsets.energy_uwh,
+            charge_throughput_uah: offsets.charge_throughput_uah,
+            energy_throughput_uwh: offsets.energy_throughput_uwh,
         })
     }
 
     pub(crate) fn push(&mut self, samples: &[MeasurementSample]) -> Result<(), String> {
-        if self.finishing || samples.is_empty() {
+        if samples.is_empty() {
             return Ok(());
+        }
+        if self.finishing {
+            return Err("recording writer is already finishing".to_string());
         }
 
         let first_sample_index = self.next_sample_index;
@@ -258,28 +347,29 @@ impl Recorder {
             .iter()
             .copied()
             .enumerate()
-            .map(|(offset, sample)| RecordingRow::from_sample(sample, self.origin, first_sample_index + offset as u64))
+            .map(|(offset, sample)| {
+                RecordingRow::from_sample(sample, self.origin, self.offsets, first_sample_index + offset as u64)
+            })
             .collect::<Vec<_>>();
 
-        match self.command_tx.try_send(WriterCommand::Rows(rows)) {
+        match self.command_tx.send(WriterCommand::Rows(rows)) {
             Ok(()) => {
                 self.next_sample_index += samples.len() as u64;
                 if let Some(last) = samples.last() {
-                    let last = RecordingRow::from_sample(*last, self.origin, self.next_sample_index - 1);
+                    let last = RecordingRow::from_sample(*last, self.origin, self.offsets, self.next_sample_index - 1);
                     self.rows = self.next_sample_index;
                     self.elapsed_us = last.elapsed_us;
                     self.missing_samples = last.cumulative_missing_samples;
                     self.interpolated_duration_us = last.cumulative_interpolated_duration_us;
                     self.discarded_sequence_samples = last.cumulative_discarded_sequence_samples;
+                    self.charge_uah = last.charge_uah;
+                    self.energy_uwh = last.energy_uwh;
+                    self.charge_throughput_uah = last.charge_throughput_uah;
+                    self.energy_throughput_uwh = last.energy_throughput_uwh;
                 }
                 Ok(())
             }
-            Err(TrySendError::Full(_)) => {
-                let error = "recording writer could not keep up; capture stopped rather than dropping rows".to_string();
-                self.interrupted = Some(error.clone());
-                Err(error)
-            }
-            Err(TrySendError::Disconnected(_)) => {
+            Err(_) => {
                 let error = "recording writer stopped unexpectedly".to_string();
                 self.interrupted = Some(error.clone());
                 Err(error)
@@ -299,6 +389,35 @@ impl Recorder {
 
     pub(crate) const fn is_finishing(&self) -> bool {
         self.finishing
+    }
+
+    pub(crate) fn continuation_offsets(&self) -> RecordingOffsets {
+        RecordingOffsets {
+            elapsed_us: self.elapsed_us,
+            sample_index: self.rows,
+            charge_uah: self.charge_uah,
+            energy_uwh: self.energy_uwh,
+            charge_throughput_uah: self.charge_throughput_uah,
+            energy_throughput_uwh: self.energy_throughput_uwh,
+            cumulative_missing_samples: self.missing_samples,
+            cumulative_interpolated_duration_us: self.interpolated_duration_us,
+            cumulative_discarded_sequence_samples: self.discarded_sequence_samples,
+        }
+    }
+
+    pub(crate) fn summary_snapshot(&self) -> RecordingSummary {
+        RecordingSummary {
+            path: self.path.clone(),
+            rows: self.rows,
+            elapsed_us: self.elapsed_us,
+            missing_samples: self.missing_samples,
+            interpolated_duration_us: self.interpolated_duration_us,
+            discarded_sequence_samples: self.discarded_sequence_samples,
+            charge_uah: self.charge_uah,
+            energy_uwh: self.energy_uwh,
+            charge_throughput_uah: self.charge_throughput_uah,
+            energy_throughput_uwh: self.energy_throughput_uwh,
+        }
     }
 
     pub(crate) fn poll_event(&mut self) -> Option<RecordingEvent> {
@@ -335,18 +454,20 @@ fn run_writer(
     partial_path: &Path,
     format: RecordingFormat,
     metadata: RecordingMetadata,
+    offsets: RecordingOffsets,
     command_rx: Receiver<WriterCommand>,
 ) -> Result<RecordingSummary, Box<dyn Error + Send + Sync>> {
     let file = File::create(partial_path)?;
     match format {
-        RecordingFormat::Parquet => write_parquet(file, metadata, command_rx, partial_path),
-        RecordingFormat::Csv => write_csv(file, command_rx, partial_path),
+        RecordingFormat::Parquet => write_parquet(file, metadata, offsets, command_rx, partial_path),
+        RecordingFormat::Csv => write_csv(file, offsets, command_rx, partial_path),
     }
 }
 
 fn write_parquet(
     file: File,
     metadata: RecordingMetadata,
+    offsets: RecordingOffsets,
     command_rx: Receiver<WriterCommand>,
     partial_path: &Path,
 ) -> Result<RecordingSummary, Box<dyn Error + Send + Sync>> {
@@ -374,6 +495,7 @@ fn write_parquet(
             Ok(())
         },
         partial_path,
+        offsets,
     )?;
     writer.finish()?;
     Ok(summary)
@@ -381,6 +503,7 @@ fn write_parquet(
 
 fn write_csv(
     file: File,
+    offsets: RecordingOffsets,
     command_rx: Receiver<WriterCommand>,
     partial_path: &Path,
 ) -> Result<RecordingSummary, Box<dyn Error + Send + Sync>> {
@@ -394,6 +517,7 @@ fn write_csv(
             Ok(())
         },
         partial_path,
+        offsets,
     )?;
     writer.finish()?;
     Ok(summary)
@@ -403,6 +527,7 @@ fn consume_rows<F>(
     command_rx: Receiver<WriterCommand>,
     mut write: F,
     partial_path: &Path,
+    offsets: RecordingOffsets,
 ) -> Result<RecordingSummary, Box<dyn Error + Send + Sync>>
 where
     F: FnMut(&[RecordingRow]) -> Result<(), Box<dyn Error + Send + Sync>>,
@@ -410,11 +535,15 @@ where
     let mut buffered = Vec::with_capacity(ROW_GROUP_SIZE);
     let mut summary = RecordingSummary {
         path: partial_path.to_path_buf(),
-        rows: 0,
-        elapsed_us: 0,
-        missing_samples: 0,
-        interpolated_duration_us: 0,
-        discarded_sequence_samples: 0,
+        rows: offsets.sample_index,
+        elapsed_us: offsets.elapsed_us,
+        missing_samples: offsets.cumulative_missing_samples,
+        interpolated_duration_us: offsets.cumulative_interpolated_duration_us,
+        discarded_sequence_samples: offsets.cumulative_discarded_sequence_samples,
+        charge_uah: offsets.charge_uah,
+        energy_uwh: offsets.energy_uwh,
+        charge_throughput_uah: offsets.charge_throughput_uah,
+        energy_throughput_uwh: offsets.energy_throughput_uwh,
     };
 
     loop {
@@ -426,6 +555,10 @@ where
                     summary.missing_samples = last.cumulative_missing_samples;
                     summary.interpolated_duration_us = last.cumulative_interpolated_duration_us;
                     summary.discarded_sequence_samples = last.cumulative_discarded_sequence_samples;
+                    summary.charge_uah = last.charge_uah;
+                    summary.energy_uwh = last.energy_uwh;
+                    summary.charge_throughput_uah = last.charge_throughput_uah;
+                    summary.energy_throughput_uwh = last.energy_throughput_uwh;
                 }
                 buffered.append(&mut rows);
                 if buffered.len() >= ROW_GROUP_SIZE {
@@ -529,13 +662,28 @@ mod tests {
     #[test]
     fn recording_rows_are_relative_to_the_start() {
         let origin = RecordingOrigin::from(Some(sample(1_000_000, 2, 40_000)));
-        let row = RecordingRow::from_sample(sample(2_000_000, 3, 60_000), origin, 0);
+        let row = RecordingRow::from_sample(sample(2_000_000, 3, 60_000), origin, RecordingOffsets::default(), 0);
 
         assert_eq!(row.elapsed_us, 1_000_000);
         assert_eq!(row.sample_index, 0);
         assert_eq!(row.cumulative_missing_samples, 1);
         assert_eq!(row.cumulative_interpolated_duration_us, 20_000);
         assert_eq!(row.charge_uah, 0.0);
+    }
+
+    #[test]
+    fn pause_rebase_excludes_pause_interval_from_recording_rows() {
+        let mut origin = RecordingOrigin::from(Some(sample(1_000_000, 2, 40_000)));
+        let paused = sample(2_000_000, 3, 60_000);
+        let resumed = sample(5_000_000, 8, 120_000);
+
+        origin.rebase_after_pause(paused, resumed);
+        let row = RecordingRow::from_sample(resumed, origin, RecordingOffsets::default(), 0);
+
+        assert_eq!(row.elapsed_us, 1_000_000);
+        assert_eq!(row.cumulative_missing_samples, 1);
+        assert_eq!(row.cumulative_interpolated_duration_us, 20_000);
+        assert_eq!(row.energy_throughput_uwh, 0.0);
     }
 
     #[test]
@@ -547,13 +695,22 @@ mod tests {
             missing_samples: 2,
             interpolated_duration_us: 10_000,
             discarded_sequence_samples: 0,
+            charge_uah: 0.0,
+            energy_uwh: 0.0,
+            charge_throughput_uah: 0.0,
+            energy_throughput_uwh: 0.0,
         };
         assert_eq!(summary.completeness_percent(), 99.0);
     }
 
     #[test]
     fn dataframe_uses_the_stable_recording_schema() {
-        let row = RecordingRow::from_sample(sample(1_000, 0, 0), RecordingOrigin::from(None), 0);
+        let row = RecordingRow::from_sample(
+            sample(1_000, 0, 0),
+            RecordingOrigin::from(None),
+            RecordingOffsets::default(),
+            0,
+        );
         let dataframe = rows_to_dataframe(&[row]).unwrap();
 
         assert_eq!(dataframe.height(), 1);
@@ -591,6 +748,36 @@ mod tests {
             dataframe.column("vbus_uv").unwrap().i64().unwrap().get(0),
             Some(5_000_000)
         );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn recorder_accepts_a_bursty_unlock_catch_up_without_dropping_rows() {
+        let path = test_path("unlock-catch-up.csv");
+        let mut recorder =
+            Recorder::start(path.clone(), RecordingFormat::Csv, RecordingMetadata::default(), None).unwrap();
+        let rows = 4_096_u64;
+        for index in 0..rows {
+            recorder.push(&[sample(index * 20_000, 0, 0)]).unwrap();
+        }
+        recorder.request_finish().unwrap();
+        assert!(
+            recorder.push(&[sample(rows * 20_000, 0, 0)]).is_err(),
+            "a finishing writer must not silently accept rows"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let summary = loop {
+            match recorder.poll_event() {
+                Some(RecordingEvent::Finished(summary)) => break summary,
+                Some(event) => panic!("unlock catch-up recording failed: {event:?}"),
+                None if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
+                None => panic!("unlock catch-up recording did not finish"),
+            }
+        };
+        let dataframe = CsvReader::new(File::open(&path).unwrap()).finish().unwrap();
+        assert_eq!(summary.rows, rows);
+        assert_eq!(dataframe.height(), rows as usize);
         std::fs::remove_file(path).unwrap();
     }
 
@@ -732,8 +919,18 @@ mod tests {
     fn write_test_recording(path: &Path, format: RecordingFormat) -> RecordingSummary {
         let (command_tx, command_rx) = mpsc::sync_channel(2);
         let rows = vec![
-            RecordingRow::from_sample(sample(0, 0, 0), RecordingOrigin::from(None), 0),
-            RecordingRow::from_sample(sample(20_000, 1, 20_000), RecordingOrigin::from(None), 1),
+            RecordingRow::from_sample(
+                sample(0, 0, 0),
+                RecordingOrigin::from(None),
+                RecordingOffsets::default(),
+                0,
+            ),
+            RecordingRow::from_sample(
+                sample(20_000, 1, 20_000),
+                RecordingOrigin::from(None),
+                RecordingOffsets::default(),
+                1,
+            ),
         ];
         command_tx.send(WriterCommand::Rows(rows)).unwrap();
         command_tx.send(WriterCommand::Finish).unwrap();
@@ -746,6 +943,7 @@ mod tests {
                 firmware: "1.9.9".to_string(),
                 serial: "test".to_string(),
             },
+            RecordingOffsets::default(),
             command_rx,
         )
         .unwrap()

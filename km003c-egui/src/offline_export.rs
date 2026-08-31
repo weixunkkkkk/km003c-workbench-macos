@@ -23,7 +23,6 @@ pub(crate) enum OfflineExportEvent {
 pub(crate) struct OfflineExportTask {
     event_rx: Receiver<OfflineExportEvent>,
     handle: Option<JoinHandle<()>>,
-    pub(crate) path: PathBuf,
 }
 
 impl OfflineExportTask {
@@ -62,7 +61,6 @@ impl OfflineExportTask {
         Ok(Self {
             event_rx,
             handle: Some(handle),
-            path,
         })
     }
 

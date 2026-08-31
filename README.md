@@ -69,14 +69,26 @@ Command-line tools:
 
 ### `km003c-egui`
 GUI application featuring:
-- Three independently configurable plots for live or device-stored measurements
+- A no-scroll monitor workspace with grayscale voltage/current/power cards, colored channel rails, and tabular monospace readouts
+- A recording-first combined V/A/W plot: live cards remain visible at idle, while waveform, navigator, and statistics appear only for an explicit recording or loaded file
+- Full-session, latest 2s/10s/30s/1min/5min, and arbitrary manually selected chart ranges
+- A fixed all/window information bar below the plot for duration, capacity, cumulative energy, and sample count
+- A synchronized vertical cursor with nearest-sample voltage/current/power table and pin control
+- A single normalized plot axis that avoids overlapping V/A/W scales; selectable channel chips show each real adaptive range in V/A/W, mV/mA/mW, or µV/µA/µW
+- Default five-point median display filtering with a faint raw-spike envelope; recorded/exported samples remain raw
+- A progressively compacted whole-session navigator that retains bucket extrema during long 1000 SPS runs
+- Recording-scoped instrument cards with current, minimum, average, and maximum values
+- Pixel-aware min/max plot downsampling and logarithmic-time cursor lookup
 - AdcQueue streaming with configurable sample rates
 - Adjustable time window (2s to 5min or all data)
-- Live recording and plot-buffer export to Parquet or CSV
+- Immediate start, pause, resume, recoverable temporary capture, and safely finalized Parquet/CSV save
+- Recording duration, direction-independent cumulative energy, accumulated capacity, signed net energy, and optional sustained-low-power auto-pause
+- Strict import of KM003C 23-column Parquet/CSV recordings with schema and timestamp validation
 - Device-stored offline recording catalog, download, plotting, and Parquet/CSV export
 - Host-integrated charge and energy with explicit missing-sample quality data
-- Combined wire-message and firmware-state USB PD timeline with source filters
-- Device info panel with auth status
+- A typed current-protocol card that confirms Fixed/PPS/EPR/AVS only after Request, Accept, and PS_RDY
+- Dedicated full-height PD analysis page for wire messages and firmware-state traces
+- A grouped settings drawer with compact common sections and collapsed device, recovery, offline, diagnostic, and about sections
 - Connect/disconnect control
 
 ### Python Bindings
@@ -141,8 +153,11 @@ cargo run --bin offline-log -- download --index 0 --format csv
 #### GUI Application
 
 ```bash
-cargo run --bin km003c-egui
+cargo run -p km003c-egui --bin KM003CWorkbench
 ```
+
+For deterministic UI inspection without a connected device, append `--demo`.
+Demo mode is visibly watermarked and is never enabled by a normal launch.
 
 The GUI records the complete AdcQueue sample set, independently of which three
 measurements are currently plotted. Parquet is the default format; CSV is
@@ -150,7 +165,7 @@ available for compatibility. Each row contains device-relative time and
 sequence information, VBUS/current/power, CC1/CC2/D+/D- voltages, and cumulative
 charge and energy. Integer electrical columns use units in their names
 (`*_uv`, `*_ua`, and `*_uw`). Signed net accumulation is stored in
-`charge_uah` and `energy_uwh`; positive transferred totals are stored in
+`charge_uah` and `energy_uwh`; direction-independent transferred totals are stored in
 `charge_throughput_uah` and `energy_throughput_uwh`.
 
 Charge and energy use trapezoidal integration over the KM003C sequence clock.
@@ -165,8 +180,11 @@ GUI reports completeness as the fraction of elapsed time covered by received
 intervals rather than estimated gap intervals.
 
 The **Offline Recordings** section loads the catalog stored by the KM003C,
-downloads a selected entry, and switches the same three plots between live and
-offline data. Offline exports use the same 23-column Parquet/CSV schema as live
+downloads a selected entry, and switches the combined monitor between live and
+offline data. Desktop Parquet/CSV files produced by the app can be imported into
+the same workspace; files with missing columns, incompatible types, or unordered
+timestamps are rejected with a specific error. Offline exports use the same
+23-column Parquet/CSV schema as live
 captures. Fields that the device does not store in offline samples—sequence,
 marker, sample rate, gap quality, CC1/CC2, and D+/D-—are null rather than
 fabricated as zero. Signed charge and energy preserve the device accumulators;
@@ -341,6 +359,15 @@ Contributions welcome! See the research repository for protocol details.
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
 [MIT license](LICENSE-MIT) at your option.
+
+## Open-source sources and references
+
+- **USB / measurement / USB PD / export core:** [okhsunrog/km003c-rs](https://github.com/okhsunrog/km003c-rs), reused under MIT / Apache-2.0.
+- **Instrument-style visualization and interaction reference:** [KHWLGH/WITRN-RS](https://github.com/KHWLGH/WITRN-RS), whose public README, changelog, and architecture notes informed the independent Rust/egui implementation. WITRN-RS is GPL-3.0; this project does not copy its source code.
+
+See [`Distribution/WITRN-RS-参考迁移.md`](Distribution/WITRN-RS-参考迁移.md) for the feature mapping, deliberate differences, and license boundary.
+
+The monitor layout also acknowledges a **Coolapk screenshot supplied by the user** as a visual/interaction reference for the WITRN-style presentation. It is not a code dependency, and no original code, assets, or branding were copied.
 
 ## Related Projects
 

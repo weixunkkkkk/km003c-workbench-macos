@@ -10,18 +10,24 @@ repository.workspace = true
 publish = false
 
 [[bin]]
-name = "km003c-egui"
+name = "KM003CWorkbench"
 path = "src/main.rs"
 
 [dependencies]
+chrono = { version = "0.4.45", features = ["serde"] }
+chrono-tz = "0.10.4"
 km003c-lib = { workspace = true, features = ["usbpd"] }
-eframe = "0.35.0"
+eframe = { version = "0.35.0", features = ["persistence"] }
+egui-system-fonts = "0.35.0"
 egui_plot = "0.36.0"
 polars = { version = "0.54.4", default-features = false, features = ["csv", "parquet"] }
 rfd = "0.17.2"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.151"
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+tracing-appender = "0.2.3"
 
 [dev-dependencies]
 hex = "0.4.3"

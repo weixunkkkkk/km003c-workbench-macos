@@ -8,3 +8,9 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+
+# Local macOS packaging output and recovery data. Release binaries are
+# distributed separately as DMG assets and must not enter the source repo.
+.DS_Store
+/.build-cache/
+/release/

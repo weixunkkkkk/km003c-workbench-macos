@@ -3,6 +3,9 @@ use km003c_lib::uom::si::electric_current::microampere;
 use km003c_lib::uom::si::electric_potential::microvolt;
 use km003c_lib::uom::si::power::microwatt;
 use km003c_lib::{AdcQueueSample, GraphSampleRate};
+use serde::{Deserialize, Serialize};
+
+use crate::i18n::Language;
 
 const MICROSECONDS_PER_MILLISECOND: u64 = 1_000;
 const MICROSECONDS_PER_HOUR: f64 = 3_600_000_000.0;
@@ -149,7 +152,7 @@ impl MeasurementAccumulator {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum PlotMetric {
     Voltage,
     Current,
@@ -183,21 +186,21 @@ impl PlotMetric {
         Self::DMinus,
     ];
 
-    pub(crate) const fn label(self) -> &'static str {
+    pub(crate) const fn localized_label(self, language: Language) -> &'static str {
         match self {
-            Self::Voltage => "Voltage",
-            Self::Current => "Current (absolute)",
-            Self::SignedCurrent => "Current (signed)",
-            Self::Power => "Power (absolute)",
-            Self::SignedPower => "Power (signed)",
-            Self::Charge => "Charge transferred",
-            Self::SignedCharge => "Net charge (signed)",
-            Self::Energy => "Energy transferred",
-            Self::SignedEnergy => "Net energy (signed)",
-            Self::Cc1 => "CC1 voltage",
-            Self::Cc2 => "CC2 voltage",
-            Self::DPlus => "D+ voltage",
-            Self::DMinus => "D- voltage",
+            Self::Voltage => language.pick("电压", "Voltage"),
+            Self::Current => language.pick("电流（绝对值）", "Current (absolute)"),
+            Self::SignedCurrent => language.pick("电流（带方向）", "Current (signed)"),
+            Self::Power => language.pick("功率（绝对值）", "Power (absolute)"),
+            Self::SignedPower => language.pick("功率（带方向）", "Power (signed)"),
+            Self::Charge => language.pick("累计容量", "Charge throughput"),
+            Self::SignedCharge => language.pick("净电荷", "Net charge"),
+            Self::Energy => language.pick("累计能量", "Energy throughput"),
+            Self::SignedEnergy => language.pick("净能量", "Net energy"),
+            Self::Cc1 => "CC1",
+            Self::Cc2 => "CC2",
+            Self::DPlus => "D+",
+            Self::DMinus => "D−",
         }
     }
 
@@ -235,9 +238,9 @@ impl PlotMetric {
 
     pub(crate) const fn color(self) -> egui::Color32 {
         match self {
-            Self::Voltage => egui::Color32::GREEN,
-            Self::Current | Self::SignedCurrent => egui::Color32::BLUE,
-            Self::Power | Self::SignedPower => egui::Color32::from_rgb(255, 165, 0),
+            Self::Voltage => egui::Color32::from_rgb(0x62, 0xB6, 0xF5),
+            Self::Current | Self::SignedCurrent => egui::Color32::from_rgb(0x39, 0xD9, 0x8A),
+            Self::Power | Self::SignedPower => egui::Color32::from_rgb(0xFF, 0x8A, 0x3D),
             Self::Charge | Self::SignedCharge => egui::Color32::from_rgb(180, 120, 255),
             Self::Energy | Self::SignedEnergy => egui::Color32::from_rgb(255, 100, 180),
             Self::Cc1 => egui::Color32::from_rgb(100, 200, 255),

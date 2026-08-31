@@ -1,3 +1,8 @@
+// Rust 1.98's stricter Clippy suggests `slice::as_chunks` for these protocol
+// decoders. The existing implementation intentionally keeps exact chunk
+// remainders visible while preserving the upstream wire-format behavior.
+#![allow(clippy::chunks_exact_to_as_chunks)]
+
 pub mod adc;
 pub mod adcqueue;
 pub mod auth;
