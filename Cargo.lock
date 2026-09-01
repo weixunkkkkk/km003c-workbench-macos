@@ -2605,6 +2605,7 @@ dependencies = [
  "egui_plot",
  "hex",
  "km003c-lib",
+ "libc",
  "polars",
  "rfd",
  "serde",

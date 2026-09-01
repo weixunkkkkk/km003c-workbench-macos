@@ -41,9 +41,18 @@ use recording_session::{
     write_manifest, write_sidecar,
 };
 use sleep_assertion::IdleSleepAssertion;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+#[cfg(unix)]
+use std::fs::{File, OpenOptions};
+use std::io;
+#[cfg(unix)]
+use std::io::Write;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -52,6 +61,97 @@ use tracing::{debug, error, info, warn};
 /// Consecutive sample messages are coalesced into one recorder hand-off, and
 /// any remaining backlog is handled on the next repaint.
 const MAX_USB_MESSAGES_PER_FRAME: usize = 64;
+
+struct SingleInstanceGuard {
+    #[cfg(unix)]
+    lock_file: File,
+    #[cfg(unix)]
+    lock_path: PathBuf,
+    #[cfg(unix)]
+    activation_path: PathBuf,
+    #[cfg(unix)]
+    activation_cursor: AtomicU64,
+}
+
+impl SingleInstanceGuard {
+    #[cfg(unix)]
+    fn acquire(app_id: &str) -> io::Result<Option<Self>> {
+        let (lock_path, activation_path) = instance_lock_paths(app_id);
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)?;
+
+        // SAFETY: `lock_file` owns a valid descriptor for the duration of the
+        // call. `flock` neither retains the pointer nor accesses Rust memory.
+        let lock_result = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if lock_result == 0 {
+            std::fs::write(&activation_path, [])?;
+            return Ok(Some(Self {
+                lock_file,
+                lock_path,
+                activation_path,
+                activation_cursor: AtomicU64::new(0),
+            }));
+        }
+
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::WouldBlock {
+            return Err(error);
+        }
+
+        // The secondary process only appends an activation byte, then exits.
+        // The primary polls the file length from its normal egui frame loop.
+        let mut activation_file = OpenOptions::new().create(true).append(true).open(&activation_path)?;
+        activation_file.write_all(b"1")?;
+        activation_file.sync_data()?;
+        Ok(None)
+    }
+
+    #[cfg(unix)]
+    fn activation_requested(&self) -> bool {
+        let length = std::fs::metadata(&self.activation_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let previous = self.activation_cursor.swap(length, Ordering::AcqRel);
+        length > previous
+    }
+
+    #[cfg(not(unix))]
+    fn acquire(_app_id: &str) -> io::Result<Option<Self>> {
+        Ok(Some(Self {}))
+    }
+
+    #[cfg(not(unix))]
+    const fn activation_requested(&self) -> bool {
+        false
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {
+        // SAFETY: the descriptor remains valid until this struct is dropped.
+        let _ = unsafe { libc::flock(self.lock_file.as_raw_fd(), libc::LOCK_UN) };
+        let _ = std::fs::remove_file(&self.activation_path);
+        let _ = std::fs::remove_file(&self.lock_path);
+    }
+}
+
+fn instance_lock_paths(app_id: &str) -> (PathBuf, PathBuf) {
+    // Keep production, demo and test instances isolated without exposing the
+    // full bundle identifier in temporary filenames.
+    let hash = app_id.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    let root = std::env::temp_dir();
+    (
+        root.join(format!("km003c-{hash:016x}.lock")),
+        root.join(format!("km003c-{hash:016x}.activate")),
+    )
+}
 
 /// Message from USB task to UI
 #[derive(Debug, Clone)]
@@ -384,6 +484,81 @@ impl EngineeringPresentation {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CumulativeUnit {
+    Energy,
+    Capacity,
+}
+
+impl CumulativeUnit {
+    const fn whole_symbol(self) -> &'static str {
+        match self {
+            Self::Energy => "Wh",
+            Self::Capacity => "Ah",
+        }
+    }
+
+    const fn milli_symbol(self) -> &'static str {
+        match self {
+            Self::Energy => "mWh",
+            Self::Capacity => "mAh",
+        }
+    }
+
+    const fn micro_symbol(self) -> &'static str {
+        match self {
+            Self::Energy => "µWh",
+            Self::Capacity => "µAh",
+        }
+    }
+}
+
+/// Presentation for cumulative traces.  Plot coordinates are kept in the
+/// stable storage units (mWh/mAh), while the axis chooses Wh, mWh or µWh/µAh
+/// so a short recording never looks like a flat zero line.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CumulativePresentation {
+    multiplier: f64,
+    symbol: &'static str,
+    decimals: usize,
+}
+
+impl CumulativePresentation {
+    fn for_maximum(maximum_milli: f64, unit: CumulativeUnit) -> Self {
+        let maximum = maximum_milli.abs();
+        let (multiplier, symbol) = if maximum >= 1_000.0 {
+            (0.001, unit.whole_symbol())
+        } else if maximum > 0.0 && maximum < 0.1 {
+            (1_000.0, unit.micro_symbol())
+        } else {
+            (1.0, unit.milli_symbol())
+        };
+        let scaled_tick = maximum * multiplier / 5.0;
+        let decimals = if scaled_tick >= 100.0 {
+            0
+        } else if scaled_tick >= 10.0 {
+            1
+        } else if scaled_tick >= 1.0 {
+            2
+        } else if scaled_tick >= 0.1 {
+            3
+        } else if scaled_tick >= 0.01 {
+            4
+        } else {
+            5
+        };
+        Self {
+            multiplier,
+            symbol,
+            decimals,
+        }
+    }
+
+    fn format_value(self, value_milli: f64) -> String {
+        format!("{:.*}", self.decimals, value_milli * self.multiplier)
+    }
+}
+
 fn nice_axis_ceiling(value: f64) -> f64 {
     if !value.is_finite() || value <= 0.0 {
         return 1.0;
@@ -468,6 +643,10 @@ struct NavigatorOverviewPoint {
     values: [f64; 3],
     minimums: [f64; 3],
     maximums: [f64; 3],
+    /// Cumulative energy (uWh) and capacity (uAh) at the end of this
+    /// overview bucket.  These values are presentation data only; the
+    /// original samples remain the source for recording and export.
+    accumulated: [f64; 2],
 }
 
 /// A bounded, progressively compacted overview of the entire live session.
@@ -509,18 +688,24 @@ impl NavigatorHistory {
         }
     }
 
-    fn push(&mut self, sample: MeasurementSample) {
-        self.push_values(
+    #[cfg(test)]
+    fn push_values(&mut self, time_seconds: f64, values: [f64; 3]) {
+        self.push_values_with_accumulated(time_seconds, values, [0.0; 2]);
+    }
+
+    fn push_with_accumulated(&mut self, sample: MeasurementSample, accumulated: [f64; 2]) {
+        self.push_values_with_accumulated(
             sample.elapsed_seconds(),
             [
                 sample.vbus_uv as f64 / 1_000_000.0,
                 (sample.ibus_ua as f64 / 1_000_000.0).abs(),
                 (sample.power_uw as f64 / 1_000_000.0).abs(),
             ],
+            accumulated,
         );
     }
 
-    fn push_values(&mut self, time_seconds: f64, values: [f64; 3]) {
+    fn push_values_with_accumulated(&mut self, time_seconds: f64, values: [f64; 3], accumulated: [f64; 2]) {
         if !time_seconds.is_finite() || values.iter().any(|value| !value.is_finite()) {
             return;
         }
@@ -543,6 +728,9 @@ impl NavigatorHistory {
                 }
                 point.minimums = self.minimums;
                 point.maximums = self.maximums;
+                if accumulated.iter().all(|value| value.is_finite()) {
+                    point.accumulated = accumulated;
+                }
             }
             return;
         }
@@ -557,6 +745,7 @@ impl NavigatorHistory {
             values,
             minimums: values,
             maximums: values,
+            accumulated,
         });
         if self.points.len() > self.max_points {
             self.compact();
@@ -585,6 +774,7 @@ impl NavigatorHistory {
                 values,
                 minimums,
                 maximums,
+                accumulated: last.accumulated,
             });
         }
         self.points = compacted;
@@ -611,6 +801,8 @@ impl NavigatorHistory {
                 voltage: point.values[0],
                 current: point.values[1],
                 power: point.values[2],
+                cumulative_energy_uwh: point.accumulated[0],
+                capacity_uah: point.accumulated[1],
                 approximate: true,
             }
         })
@@ -634,6 +826,8 @@ struct CursorReadout {
     voltage: f64,
     current: f64,
     power: f64,
+    cumulative_energy_uwh: f64,
+    capacity_uah: f64,
     approximate: bool,
 }
 
@@ -1164,6 +1358,10 @@ struct PowerMonitorApp {
     language: Language,
     /// Complete live samples retained for plotting
     data_points: VecDeque<MeasurementSample>,
+    /// Recording-relative cumulative values aligned with `data_points` by
+    /// sample index. This stays outside the measurement/recording contract so
+    /// pause/resume origins can be rendered without changing the 23 columns.
+    recording_plot_values: HashMap<u64, [f64; 2]>,
     /// Progressively compacted whole-session overview for the navigator.
     navigator_history: NavigatorHistory,
     /// Unwraps device time and integrates charge and energy
@@ -1191,6 +1389,9 @@ struct PowerMonitorApp {
     clear_data_confirmation: bool,
     /// Deterministic UI-only data source for screenshots and smoke tests.
     demo_mode: bool,
+    /// Owns the process-wide activation socket. A second launch connects to
+    /// this socket and asks the existing viewport to come to the foreground.
+    single_instance_guard: Option<SingleInstanceGuard>,
     demo_started: Instant,
     demo_last_tick: Instant,
     demo_sequence: u16,
@@ -1226,6 +1427,8 @@ struct PowerMonitorApp {
     settings_page: SettingsPage,
     advanced_analysis_open: bool,
     visible_series: [bool; 3],
+    /// Cumulative energy and capacity traces shown on the monitor chart.
+    visible_accumulated_series: [bool; 2],
     chart_follow_mode: ChartFollowMode,
     display_filter: DisplayFilter,
     chart_viewport: ChartViewport,
@@ -1370,9 +1573,11 @@ impl PowerMonitorApp {
         usb_receiver: mpsc::UnboundedReceiver<UsbMessage>,
         cmd_sender: mpsc::UnboundedSender<UsbCommand>,
         demo_mode: bool,
+        single_instance_guard: Option<SingleInstanceGuard>,
     ) -> Self {
         theme::apply(&cc.egui_ctx);
         let mut app = Self::with_defaults(usb_receiver, cmd_sender, demo_mode);
+        app.single_instance_guard = single_instance_guard;
         if let Some(storage) = cc.storage
             && let Some(prefs) = eframe::get_value::<AppPreferences>(storage, eframe::APP_KEY)
         {
@@ -1395,6 +1600,7 @@ impl PowerMonitorApp {
         Self {
             language: Language::SimplifiedChinese,
             data_points: VecDeque::new(),
+            recording_plot_values: HashMap::new(),
             navigator_history: NavigatorHistory::default(),
             measurement_accumulator: MeasurementAccumulator::default(),
             measurement_resume_offsets: None,
@@ -1417,6 +1623,7 @@ impl PowerMonitorApp {
             disconnect_confirmation: false,
             clear_data_confirmation: false,
             demo_mode,
+            single_instance_guard: None,
             demo_started: now,
             demo_last_tick: now,
             demo_sequence: 0,
@@ -1438,6 +1645,7 @@ impl PowerMonitorApp {
             settings_page: SettingsPage::General,
             advanced_analysis_open: false,
             visible_series: [true; 3],
+            visible_accumulated_series: [true; 2],
             chart_follow_mode: ChartFollowMode::LatestWindow,
             display_filter: DisplayFilter::Median5,
             chart_viewport: ChartViewport::default(),
@@ -1536,6 +1744,7 @@ impl PowerMonitorApp {
         if !self.visible_series.iter().any(|visible| *visible) {
             self.visible_series = [true; 3];
         }
+        self.visible_accumulated_series = prefs.visible_accumulated_series;
         self.chart_follow_mode = if prefs.follow_latest && self.time_window == TimeWindow::All {
             ChartFollowMode::FullSession
         } else if prefs.follow_latest {
@@ -1565,6 +1774,7 @@ impl PowerMonitorApp {
             auto_pause_delay_ms: self.auto_pause_delay_ms,
             active_tab: self.active_tab,
             visible_series: self.visible_series,
+            visible_accumulated_series: self.visible_accumulated_series,
             follow_latest: self.chart_follow_mode.is_following(),
             display_filter: self.display_filter,
         }
@@ -1906,6 +2116,33 @@ impl PowerMonitorApp {
         }
     }
 
+    /// Return the cumulative values that belong on the monitor chart for a
+    /// newly received sample.  During a recording these are relative to the
+    /// current recording and remain flat while a manual/automatic pause is in
+    /// effect; outside a recording the raw device-session values are retained
+    /// for the live buffer and diagnostic views.
+    fn recording_plot_values_for_measurement(&self, sample: MeasurementSample) -> [f64; 2] {
+        if !self.recording_session {
+            return [sample.energy_throughput_uwh, sample.charge_throughput_uah];
+        }
+        if self.recording_paused {
+            return [self.recording_total_energy_uwh, self.recording_total_capacity_uah];
+        }
+        [
+            self.recording_energy_completed_uwh
+                + (sample.energy_throughput_uwh - self.recording_energy_origin_uwh).max(0.0),
+            self.recording_capacity_completed_uah
+                + (sample.charge_throughput_uah - self.recording_capacity_origin_uah).max(0.0),
+        ]
+    }
+
+    fn recording_plot_values_for_sample(&self, sample: MeasurementSample) -> [f64; 2] {
+        self.recording_plot_values
+            .get(&sample.sample_index)
+            .copied()
+            .unwrap_or_else(|| self.recording_plot_values_for_measurement(sample))
+    }
+
     fn freeze_recording_clock(&mut self) {
         self.recording_elapsed_before_pause = self.recording_elapsed_before_pause.max(self.recording_elapsed());
         self.recording_started_at = None;
@@ -2121,6 +2358,7 @@ impl PowerMonitorApp {
         self.pause_reason = None;
         self.active_pause_started_at = None;
         self.measurement_resume_offsets = None;
+        self.recording_plot_values.clear();
         if let Some(mut assertion) = self.sleep_assertion.take() {
             assertion.release();
         }
@@ -2161,6 +2399,8 @@ impl PowerMonitorApp {
                         voltage: sample.vbus_uv as f64 / 1_000_000.0,
                         current: (sample.ibus_ua as f64 / 1_000_000.0).abs(),
                         power: (sample.power_uw as f64 / 1_000_000.0).abs(),
+                        cumulative_energy_uwh: self.recording_plot_values_for_sample(sample)[0],
+                        capacity_uah: self.recording_plot_values_for_sample(sample)[1],
                         approximate: false,
                     })
                 }
@@ -2179,6 +2419,8 @@ impl PowerMonitorApp {
                     voltage: sample.vbus_uv as f64 / 1_000_000.0,
                     current: (sample.ibus_ua as f64 / 1_000_000.0).abs(),
                     power: (sample.power_uw as f64 / 1_000_000.0).abs(),
+                    cumulative_energy_uwh: sample.energy_throughput_uwh,
+                    capacity_uah: sample.charge_throughput_uah,
                     approximate: false,
                 }),
             PlotSource::Imported => self
@@ -2195,6 +2437,8 @@ impl PowerMonitorApp {
                     voltage: sample.vbus_uv as f64 / 1_000_000.0,
                     current: (sample.ibus_ua as f64 / 1_000_000.0).abs(),
                     power: (sample.power_uw as f64 / 1_000_000.0).abs(),
+                    cumulative_energy_uwh: sample.energy_throughput_uwh,
+                    capacity_uah: sample.charge_throughput_uah,
                     approximate: false,
                 }),
         }
@@ -2357,7 +2601,15 @@ impl PowerMonitorApp {
                     let voltage = EngineeringPresentation::for_value(readout.voltage, MeasurementUnit::Voltage);
                     let current = EngineeringPresentation::for_value(readout.current, MeasurementUnit::Current);
                     let power = EngineeringPresentation::for_value(readout.power, MeasurementUnit::Power);
-                    ui.columns(4, |columns| {
+                    let energy = CumulativePresentation::for_maximum(
+                        readout.cumulative_energy_uwh / 1_000.0,
+                        CumulativeUnit::Energy,
+                    );
+                    let capacity =
+                        CumulativePresentation::for_maximum(readout.capacity_uah / 1_000.0, CumulativeUnit::Capacity);
+                    let show_energy = self.visible_accumulated_series[0];
+                    let show_capacity = self.visible_accumulated_series[1];
+                    ui.columns(4 + usize::from(show_energy) + usize::from(show_capacity), |columns| {
                         let time_label = if readout.approximate {
                             language.pick("约值", "Approx.")
                         } else {
@@ -2369,22 +2621,21 @@ impl PowerMonitorApp {
                                 .strong()
                                 .color(theme::TEXT_PRIMARY),
                         );
-                        for (column, label, value, presentation, color) in [
+                        let mut column = 1;
+                        for (label, value, presentation, color) in [
                             (
-                                1,
                                 language.pick("电压", "Voltage"),
                                 readout.voltage,
                                 voltage,
                                 theme::VOLTAGE,
                             ),
                             (
-                                2,
                                 language.pick("电流", "Current"),
                                 readout.current,
                                 current,
                                 theme::CURRENT,
                             ),
-                            (3, language.pick("功率", "Power"), readout.power, power, theme::POWER),
+                            (language.pick("功率", "Power"), readout.power, power, theme::POWER),
                         ] {
                             columns[column].colored_label(
                                 color,
@@ -2392,6 +2643,34 @@ impl PowerMonitorApp {
                                     "{label}  {} {}",
                                     presentation.format_value(value),
                                     presentation.symbol
+                                ))
+                                .monospace()
+                                .strong(),
+                            );
+                            column += 1;
+                        }
+                        if show_energy {
+                            columns[column].colored_label(
+                                theme::ENERGY,
+                                egui::RichText::new(format!(
+                                    "{}  {} {}",
+                                    language.pick("累计能量", "Energy"),
+                                    energy.format_value(readout.cumulative_energy_uwh / 1_000.0),
+                                    energy.symbol,
+                                ))
+                                .monospace()
+                                .strong(),
+                            );
+                            column += 1;
+                        }
+                        if show_capacity {
+                            columns[column].colored_label(
+                                theme::CAPACITY,
+                                egui::RichText::new(format!(
+                                    "{}  {} {}",
+                                    language.pick("累计容量", "Capacity"),
+                                    capacity.format_value(readout.capacity_uah / 1_000.0),
+                                    capacity.symbol,
                                 ))
                                 .monospace()
                                 .strong(),
@@ -2424,7 +2703,11 @@ impl PowerMonitorApp {
         let threshold_micro = u64::from(auto_rule.threshold_milli).saturating_mul(1_000);
         let recovery_threshold_micro = threshold_micro.saturating_add(auto_capture_hysteresis_micro(auto_rule));
         for measurement in measurements {
-            self.navigator_history.push(*measurement);
+            let plot_accumulated = self.recording_plot_values_for_measurement(*measurement);
+            self.recording_plot_values
+                .insert(measurement.sample_index, plot_accumulated);
+            self.navigator_history
+                .push_with_accumulated(*measurement, plot_accumulated);
             self.data_points.push_back(*measurement);
             if self.recording_session && !self.recording_paused {
                 self.recording_statistics.push(*measurement);
@@ -2435,7 +2718,9 @@ impl PowerMonitorApp {
             self.current_power = measurement.power_uw as f64 / 1_000_000.0;
             self.total_samples += 1;
             while self.data_points.len() > self.max_points {
-                self.data_points.pop_front();
+                if let Some(evicted) = self.data_points.pop_front() {
+                    self.recording_plot_values.remove(&evicted.sample_index);
+                }
             }
 
             if self.recording_session && !self.recording_paused && auto_rule.enabled {
@@ -2613,7 +2898,26 @@ impl PowerMonitorApp {
     }
 
     fn clear_data(&mut self) {
+        if !self.can_clear_live_data() {
+            self.recording_status = if self.recording_session {
+                self.language
+                    .pick(
+                        "当前录制仍在保留中；请继续记录或先保存，再清空数据。",
+                        "The current recording is still retained. Resume or save it before clearing data.",
+                    )
+                    .to_string()
+            } else {
+                self.language
+                    .pick(
+                        "数据仍在写入；请等待写入完成后再清空。",
+                        "Data is still being written. Wait for it to finish before clearing.",
+                    )
+                    .to_string()
+            };
+            return;
+        }
         self.data_points.clear();
+        self.recording_plot_values.clear();
         self.navigator_history.clear();
         self.cursor_readout = None;
         self.cursor_pinned = false;
@@ -2790,9 +3094,11 @@ impl PowerMonitorApp {
         self.plot_source = PlotSource::Live;
         self.live_plot_origin_seconds = origin_sample.map_or(0.0, |sample| sample.elapsed_seconds());
         self.live_plot_origin_sample_index = origin_sample.map(|sample| sample.sample_index);
+        self.recording_plot_values.clear();
         self.navigator_history.clear();
         if let Some(sample) = origin_sample {
-            self.navigator_history.push(sample);
+            self.recording_plot_values.insert(sample.sample_index, [0.0, 0.0]);
+            self.navigator_history.push_with_accumulated(sample, [0.0, 0.0]);
         }
         self.chart_follow_mode = ChartFollowMode::FullSession;
         self.chart_viewport.selection = None;
@@ -3015,12 +3321,17 @@ impl PowerMonitorApp {
         };
 
         self.data_points.clear();
+        self.recording_plot_values.clear();
         self.navigator_history.clear();
         for sample in recording.samples.iter().copied() {
-            self.navigator_history.push(sample);
+            let accumulated = [sample.energy_throughput_uwh, sample.charge_throughput_uah];
+            self.recording_plot_values.insert(sample.sample_index, accumulated);
+            self.navigator_history.push_with_accumulated(sample, accumulated);
             self.data_points.push_back(sample);
             while self.data_points.len() > self.max_points {
-                self.data_points.pop_front();
+                if let Some(evicted) = self.data_points.pop_front() {
+                    self.recording_plot_values.remove(&evicted.sample_index);
+                }
             }
         }
         self.current_voltage = last.vbus_uv as f64 / 1_000_000.0;
@@ -3785,6 +4096,8 @@ impl PowerMonitorApp {
             voltage: self.current_voltage,
             current: self.current_current.abs(),
             power: self.current_power.abs(),
+            cumulative_energy_uwh: self.displayed_cumulative_energy_uwh(),
+            capacity_uah: self.displayed_recording_capacity_uah(),
             approximate: false,
         })
     }
@@ -3792,24 +4105,31 @@ impl PowerMonitorApp {
     /// Describes the provenance of the large V/I/P readouts independently
     /// from recording state. KM003C keeps streaming before a recording starts,
     /// so those values must remain visible as live measurements. After a USB
-    /// disconnect we retain the last numbers for reference but label them
-    /// explicitly instead of presenting stale data as live.
+    /// disconnect the measurement is unknown: stale numbers must not look like
+    /// a real zero or a current instrument reading.
     fn instrument_readout_status(&self) -> &'static str {
         match self.plot_source {
             PlotSource::Imported => self.language.pick("文件", "File"),
             PlotSource::Offline => self.language.pick("离线", "Offline"),
             PlotSource::Live if self.streaming => self.language.pick("实时", "Live"),
-            PlotSource::Live
-                if self.total_samples > 0
-                    || !self.data_points.is_empty()
-                    || self.current_voltage != 0.0
-                    || self.current_current != 0.0
-                    || self.current_power != 0.0 =>
-            {
-                self.language.pick("最后读数", "Last reading")
-            }
             PlotSource::Live => self.language.pick("等待设备", "Waiting"),
         }
+    }
+
+    fn instrument_readout_available(&self) -> bool {
+        match self.plot_source {
+            PlotSource::Imported | PlotSource::Offline => self.source_sample_count() > 0,
+            PlotSource::Live if self.streaming => self.total_samples > 0 || !self.data_points.is_empty(),
+            PlotSource::Live => false,
+        }
+    }
+
+    fn can_change_sample_rate(&self) -> bool {
+        !self.recording_session && self.recorder.is_none()
+    }
+
+    fn can_clear_live_data(&self) -> bool {
+        !self.recording_session && self.recorder.is_none()
     }
 
     fn source_statistics(&self) -> RecordingSessionStatistics {
@@ -3949,6 +4269,80 @@ impl PowerMonitorApp {
         ]
     }
 
+    /// Return cumulative energy (mWh) and capacity (mAh) traces for the
+    /// selected source.  Live recordings use the recording-relative values
+    /// captured alongside the detailed sample ring and navigator buckets;
+    /// imported/on-device files already carry recording-relative columns.
+    fn source_accumulated_points(&self, selection: NavigatorSelection, max_points: usize) -> [Vec<[f64; 2]>; 2] {
+        let in_range = |time: f64| time >= selection.start_seconds && time <= selection.end_seconds;
+        let mut energy = Vec::new();
+        let mut capacity = Vec::new();
+        let mut push = |time: f64, values_uwh_uah: [f64; 2]| {
+            if time.is_finite() && values_uwh_uah.iter().all(|value| value.is_finite()) {
+                energy.push([time, values_uwh_uah[0] / 1_000.0]);
+                capacity.push([time, values_uwh_uah[1] / 1_000.0]);
+            }
+        };
+
+        match self.plot_source {
+            PlotSource::Live => {
+                let detailed_start = self
+                    .data_points
+                    .front()
+                    .map_or(f64::INFINITY, |sample| sample.elapsed_seconds());
+                for point in &self.navigator_history.points {
+                    if point.time_seconds + f64::EPSILON < self.live_plot_origin_seconds
+                        || point.time_seconds >= detailed_start
+                    {
+                        continue;
+                    }
+                    let time = self.live_display_time(point.time_seconds);
+                    if in_range(time) {
+                        push(time, point.accumulated);
+                    }
+                }
+                for sample in &self.data_points {
+                    if sample.elapsed_seconds() + f64::EPSILON < self.live_plot_origin_seconds {
+                        continue;
+                    }
+                    let time = self.live_display_time(sample.elapsed_seconds());
+                    if in_range(time) {
+                        push(time, self.recording_plot_values_for_sample(*sample));
+                    }
+                }
+            }
+            PlotSource::Offline => {
+                if let Some(view) = &self.offline_view {
+                    for sample in view.samples.iter().filter(|sample| in_range(sample.elapsed_seconds())) {
+                        push(
+                            sample.elapsed_seconds(),
+                            [sample.energy_throughput_uwh, sample.charge_throughput_uah],
+                        );
+                    }
+                }
+            }
+            PlotSource::Imported => {
+                if let Some(recording) = &self.imported_recording {
+                    for sample in recording
+                        .samples
+                        .iter()
+                        .filter(|sample| in_range(sample.elapsed_seconds()))
+                    {
+                        push(
+                            sample.elapsed_seconds(),
+                            [sample.energy_throughput_uwh, sample.charge_throughput_uah],
+                        );
+                    }
+                }
+            }
+        }
+
+        [
+            min_max_downsample(energy, max_points),
+            min_max_downsample(capacity, max_points),
+        ]
+    }
+
     fn source_metric_points(
         &self,
         metric: PlotMetric,
@@ -4031,6 +4425,18 @@ impl PowerMonitorApp {
 
 impl PowerMonitorApp {
     fn show_workbench(&mut self, ui: &mut egui::Ui) {
+        if self
+            .single_instance_guard
+            .as_ref()
+            .is_some_and(SingleInstanceGuard::activation_requested)
+        {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                egui::UserAttentionType::Informational,
+            ));
+        }
         let usb_backlog = self.process_messages();
         self.update_demo_data();
         if usb_backlog {
@@ -4418,15 +4824,27 @@ impl PowerMonitorApp {
 
                     ui.add(egui::Separator::default().vertical().spacing(8.0));
                     let previous_rate = self.selected_rate;
-                    egui::ComboBox::from_id_salt("toolbar_sample_rate")
-                        .width(if compact { 72.0 } else { 88.0 })
-                        .selected_text(self.selected_rate.label())
-                        .show_ui(ui, |ui| {
-                            for rate in SampleRateOption::all() {
-                                ui.selectable_value(&mut self.selected_rate, *rate, rate.label());
-                            }
-                        });
-                    if self.selected_rate != previous_rate && self.device_state.is_some() && self.recorder.is_none() {
+                    let can_change_sample_rate = self.can_change_sample_rate();
+                    let rate_control = ui.add_enabled_ui(can_change_sample_rate, |ui| {
+                        egui::ComboBox::from_id_salt("toolbar_sample_rate")
+                            .width(if compact { 72.0 } else { 88.0 })
+                            .selected_text(self.selected_rate.label())
+                            .show_ui(ui, |ui| {
+                                for rate in SampleRateOption::all() {
+                                    ui.selectable_value(&mut self.selected_rate, *rate, rate.label());
+                                }
+                            });
+                    });
+                    if !can_change_sample_rate {
+                        rate_control.response.on_hover_text(language.pick(
+                            "请先保存或结束当前录制，再更改采样率。",
+                            "Save or finish the current recording before changing the sample rate.",
+                        ));
+                    }
+                    if self.selected_rate != previous_rate
+                        && can_change_sample_rate
+                        && self.device_state.is_some()
+                    {
                         let _ = self
                             .cmd_sender
                             .send(UsbCommand::SetSampleRate(self.selected_rate.to_graph_rate()));
@@ -4496,13 +4914,13 @@ impl PowerMonitorApp {
                     if density == ToolbarDensity::Full
                         && ui
                             .add_enabled(
-                                self.recorder.is_none(),
+                                self.can_clear_live_data(),
                                 egui::Button::new(language.pick("清空数据", "Clear data"))
                                     .min_size(egui::vec2(82.0, 32.0)),
                             )
                             .on_hover_text(language.pick(
-                                "清空当前实时缓冲区；已保存录制不会被删除",
-                                "Clear the current live buffer. Saved recordings are not deleted.",
+                                "清空当前实时缓冲区；录制期间请先保存当前会话",
+                                "Clear the live buffer. Save the current session before clearing while recording.",
                             ))
                             .clicked()
                     {
@@ -4535,9 +4953,13 @@ impl PowerMonitorApp {
                             }
                             if ui
                                 .add_enabled(
-                                    self.recorder.is_none(),
+                                    self.can_clear_live_data(),
                                     egui::Button::new(language.pick("清空实时数据…", "Clear live data…")),
                                 )
+                                .on_hover_text(language.pick(
+                                    "录制期间请先继续或保存当前会话",
+                                    "Resume or save the current session before clearing data",
+                                ))
                                 .clicked()
                             {
                                 self.clear_data_confirmation = true;
@@ -4667,6 +5089,7 @@ impl PowerMonitorApp {
                     .inner_margin(egui::Margin::symmetric(10, 10)),
             )
             .show(ui, |ui| {
+                self.show_monitor_connection_notice(ui);
                 let watermark_rect = ui.max_rect();
                 if self.monitor_chart_visible() {
                     self.show_combined_monitor_chart(ui, compact);
@@ -4683,6 +5106,38 @@ impl PowerMonitorApp {
                     );
                 }
             });
+    }
+
+    fn show_monitor_connection_notice(&self, ui: &mut egui::Ui) {
+        let Some(message) = i18n::connection_guidance(self.language, self.phase, self.last_connection_error.as_deref())
+        else {
+            return;
+        };
+        let color = match self.phase {
+            ConnectionPhase::DeviceBusy | ConnectionPhase::ConnectionError => theme::RECORDING,
+            ConnectionPhase::Searching | ConnectionPhase::Connecting => theme::POWER,
+            ConnectionPhase::NoDevice | ConnectionPhase::Disconnected => theme::TEXT_SECONDARY,
+            ConnectionPhase::Streaming => return,
+        };
+        let notice_width = ui.available_width();
+        egui::Frame::NONE
+            .fill(theme::PANEL_RAISED)
+            .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.55)))
+            .corner_radius(egui::CornerRadius::same(6))
+            .inner_margin(egui::Margin::symmetric(12, 7))
+            .show(ui, |ui| {
+                ui.set_width((notice_width - 24.0).max(120.0));
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(color, "●");
+                    ui.label(
+                        egui::RichText::new(i18n::connection_status(self.language, self.phase))
+                            .strong()
+                            .color(color),
+                    );
+                    ui.label(egui::RichText::new(message).color(theme::TEXT_SECONDARY));
+                });
+            });
+        ui.add_space(8.0);
     }
 
     fn show_recording_workspace_idle(&mut self, ui: &mut egui::Ui, compact: bool) {
@@ -4756,13 +5211,14 @@ impl PowerMonitorApp {
     fn show_instrument_rail(&mut self, ui: &mut egui::Ui, compact: bool) {
         let language = self.language;
         let current = self.displayed_current_readout();
+        let readout_available = self.instrument_readout_available();
         let readout_status = self.instrument_readout_status();
         let statistics = self.source_statistics();
         instrument_card(
             ui,
             InstrumentCardData {
                 label: language.pick("电压", "Voltage"),
-                value: current.voltage,
+                value: readout_available.then_some(current.voltage),
                 unit: MeasurementUnit::Voltage,
                 color: theme::VOLTAGE,
                 statistics: statistics.voltage.readout(),
@@ -4776,7 +5232,7 @@ impl PowerMonitorApp {
             ui,
             InstrumentCardData {
                 label: language.pick("电流", "Current"),
-                value: current.current,
+                value: readout_available.then_some(current.current),
                 unit: MeasurementUnit::Current,
                 color: theme::CURRENT,
                 statistics: statistics.current.readout(),
@@ -4790,7 +5246,7 @@ impl PowerMonitorApp {
             ui,
             InstrumentCardData {
                 label: language.pick("功率", "Power"),
-                value: current.power,
+                value: readout_available.then_some(current.power),
                 unit: MeasurementUnit::Power,
                 color: theme::POWER,
                 statistics: statistics.power.readout(),
@@ -5110,7 +5566,7 @@ const fn localized_session_state(state: SessionState, language: Language) -> &'s
 
 struct InstrumentCardData<'a> {
     label: &'a str,
-    value: f64,
+    value: Option<f64>,
     unit: MeasurementUnit,
     color: egui::Color32,
     statistics: Option<MetricStatistics>,
@@ -5131,8 +5587,13 @@ fn instrument_card(ui: &mut egui::Ui, data: InstrumentCardData<'_>) {
         readout_status,
     } = data;
     let card_width = ui.available_width();
-    let range_maximum = statistics.map_or(value.abs(), |statistics| {
-        statistics.maximum.abs().max(statistics.minimum.abs()).max(value.abs())
+    let numeric_value = value.unwrap_or(0.0);
+    let range_maximum = statistics.map_or(numeric_value.abs(), |statistics| {
+        statistics
+            .maximum
+            .abs()
+            .max(statistics.minimum.abs())
+            .max(numeric_value.abs())
     });
     let presentation = EngineeringPresentation::for_maximum(range_maximum, unit);
     let channel = match unit {
@@ -5187,11 +5648,13 @@ fn instrument_card(ui: &mut egui::Ui, data: InstrumentCardData<'_>) {
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
                         ui.label(
-                            egui::RichText::new(presentation.format_value(value))
-                                .monospace()
-                                .size(if compact { 30.0 } else { 34.0 })
-                                .strong()
-                                .color(color),
+                            egui::RichText::new(
+                                value.map_or_else(|| "—".to_string(), |value| presentation.format_value(value)),
+                            )
+                            .monospace()
+                            .size(if compact { 30.0 } else { 34.0 })
+                            .strong()
+                            .color(color),
                         );
                     },
                 );
@@ -5408,12 +5871,31 @@ impl PowerMonitorApp {
                 .max(240.0);
         let max_plot_points = (ui.available_width().max(320.0) * 2.0) as usize;
         let vip_points = self.source_vip_points(selection, max_plot_points, self.display_filter);
+        let accumulated_points = self.source_accumulated_points(selection, max_plot_points);
         let raw_vip_points = (self.display_filter != DisplayFilter::Raw)
             .then(|| self.source_vip_points(selection, max_plot_points / 2, DisplayFilter::Raw));
         let scales = [
             AxisScale::from_visible_max(vip_points[0].iter().map(|point| point[1]).fold(0.0_f64, f64::max)),
             AxisScale::from_visible_max(vip_points[1].iter().map(|point| point[1]).fold(0.0_f64, f64::max)),
             AxisScale::from_visible_max(vip_points[2].iter().map(|point| point[1]).fold(0.0_f64, f64::max)),
+        ];
+        let accumulated_scales = [
+            AxisScale::from_visible_max(
+                accumulated_points[0]
+                    .iter()
+                    .map(|point| point[1])
+                    .fold(0.0_f64, f64::max),
+            ),
+            AxisScale::from_visible_max(
+                accumulated_points[1]
+                    .iter()
+                    .map(|point| point[1])
+                    .fold(0.0_f64, f64::max),
+            ),
+        ];
+        let accumulated_presentations = [
+            CumulativePresentation::for_maximum(accumulated_scales[0].maximum, CumulativeUnit::Energy),
+            CumulativePresentation::for_maximum(accumulated_scales[1].maximum, CumulativeUnit::Capacity),
         ];
 
         egui::Frame::NONE
@@ -5613,6 +6095,55 @@ impl PowerMonitorApp {
                         }
                     }
 
+                    ui.separator();
+                    for (series_index, (label, color, presentation)) in [
+                        (
+                            language.pick("累计能量", "Energy"),
+                            theme::ENERGY,
+                            accumulated_presentations[0],
+                        ),
+                        (
+                            language.pick("累计容量", "Capacity"),
+                            theme::CAPACITY,
+                            accumulated_presentations[1],
+                        ),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        let visible = self.visible_accumulated_series[series_index];
+                        let marker = if series_index == 0 { "╱" } else { "╲" };
+                        let text = if compact {
+                            format!("{marker} {label}")
+                        } else {
+                            format!(
+                                "{marker} {label}  0–{} {}",
+                                presentation.format_value(accumulated_scales[series_index].maximum),
+                                presentation.symbol
+                            )
+                        };
+                        let button = egui::Button::new(egui::RichText::new(text).color(if visible {
+                            color
+                        } else {
+                            theme::TEXT_MUTED
+                        }))
+                        .fill(theme::PANEL_RAISED)
+                        .stroke(egui::Stroke::new(1.0, theme::DIVIDER))
+                        .corner_radius(egui::CornerRadius::same(6))
+                        .min_size(egui::vec2(if compact { 82.0 } else { 142.0 }, 28.0));
+                        if ui
+                            .add(button)
+                            .on_hover_text(if visible {
+                                language.pick("点击隐藏累计曲线", "Hide cumulative trace")
+                            } else {
+                                language.pick("点击显示累计曲线", "Show cumulative trace")
+                            })
+                            .clicked()
+                        {
+                            self.visible_accumulated_series[series_index] = !visible;
+                        }
+                    }
+
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let pin_label = if self.cursor_pinned {
                             if compact {
@@ -5642,7 +6173,8 @@ impl PowerMonitorApp {
                 ui.add_space(4.0);
 
                 let visible_series = self.visible_series;
-                let mut axes = Vec::with_capacity(3);
+                let visible_accumulated_series = self.visible_accumulated_series;
+                let mut axes = Vec::with_capacity(5);
                 for (series_index, (label, color, unit, placement)) in [
                     (
                         language.pick("电压", "Voltage"),
@@ -5687,6 +6219,40 @@ impl PowerMonitorApp {
                             }),
                     );
                 }
+                for (series_index, (label, color)) in [
+                    (
+                        language.pick("累计能量", "Energy"),
+                        theme::ENERGY,
+                    ),
+                    (
+                        language.pick("累计容量", "Capacity"),
+                        theme::CAPACITY,
+                    ),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    if !visible_accumulated_series[series_index] {
+                        continue;
+                    }
+                    let scale = accumulated_scales[series_index];
+                    let presentation = accumulated_presentations[series_index];
+                    let axis_label = if compact {
+                        presentation.symbol.to_string()
+                    } else {
+                        format!("{label} ({})", presentation.symbol)
+                    };
+                    axes.push(
+                        AxisHints::new_y()
+                            .label(egui::RichText::new(axis_label).color(color))
+                            .placement(HPlacement::Right)
+                            .tick_label_color(color)
+                            .min_thickness(if compact { 42.0 } else { 58.0 })
+                            .formatter(move |mark: GridMark, _| {
+                                presentation.format_value(mark.value * scale.maximum)
+                            }),
+                    );
+                }
                 let x_axis = AxisHints::new_x()
                     .formatter(|mark: GridMark, _| format_plot_time(mark.value))
                     .tick_label_color(theme::TEXT_SECONDARY)
@@ -5721,6 +6287,16 @@ impl PowerMonitorApp {
                             .collect::<Vec<_>>(),
                     ]
                 });
+                let normalized_accumulated_points = [
+                    accumulated_points[0]
+                        .iter()
+                        .map(|point| [point[0], accumulated_scales[0].normalize(point[1])])
+                        .collect::<Vec<_>>(),
+                    accumulated_points[1]
+                        .iter()
+                        .map(|point| [point[0], accumulated_scales[1].normalize(point[1])])
+                        .collect::<Vec<_>>(),
+                ];
                 let pause_intervals = self.pause_intervals.clone();
                 let active_pause = self.active_pause_started_at;
                 let active_pause_end = self.source_end_time();
@@ -5823,6 +6399,26 @@ impl PowerMonitorApp {
                                     .style(LineStyle::dashed_dense()),
                             );
                         }
+                        if visible_accumulated_series[0] {
+                            plot_ui.line(
+                                Line::new(
+                                    language.pick("累计能量", "Energy"),
+                                    PlotPoints::from(normalized_accumulated_points[0].clone()),
+                                )
+                                .color(theme::ENERGY)
+                                .width(1.5),
+                            );
+                        }
+                        if visible_accumulated_series[1] {
+                            plot_ui.line(
+                                Line::new(
+                                    language.pick("累计容量", "Capacity"),
+                                    PlotPoints::from(normalized_accumulated_points[1].clone()),
+                                )
+                                .color(theme::CAPACITY)
+                                .width(1.5),
+                            );
+                        }
 
                         let readout = if let Some(readout) = pinned_cursor {
                             readout
@@ -5860,6 +6456,38 @@ impl PowerMonitorApp {
                                 );
                             }
                         }
+                        if visible_accumulated_series[0] {
+                            plot_ui.points(
+                                Points::new(
+                                    language.pick("累计能量游标点", "Energy cursor point"),
+                                    vec![[
+                                        readout.time_seconds,
+                                        accumulated_scales[0]
+                                            .normalize(readout.cumulative_energy_uwh / 1_000.0),
+                                    ]],
+                                )
+                                .color(theme::ENERGY)
+                                .filled(true)
+                                .radius(4.0),
+                            );
+                        }
+                        if visible_accumulated_series[1] {
+                            plot_ui.points(
+                                Points::new(
+                                    language.pick("累计容量游标点", "Capacity cursor point"),
+                                    vec![
+                                        [
+                                            readout.time_seconds,
+                                            accumulated_scales[1]
+                                                .normalize(readout.capacity_uah / 1_000.0),
+                                        ],
+                                    ],
+                                )
+                                .color(theme::CAPACITY)
+                                .filled(true)
+                                .radius(4.0),
+                            );
+                        }
                         Some(readout)
                     });
 
@@ -5868,8 +6496,8 @@ impl PowerMonitorApp {
                         egui::WidgetType::Other,
                         true,
                         language.pick(
-                            "电压、电流和功率联动曲线；移动鼠标读取同一时刻数值",
-                            "Linked voltage, current, and power trace. Move the pointer to inspect matching values.",
+                            "电压、电流、功率、累计能量和累计容量联动曲线；移动鼠标读取同一时刻数值",
+                            "Linked voltage, current, power, energy, and capacity traces. Move the pointer to inspect matching values.",
                         ),
                     )
                 });
@@ -7080,6 +7708,19 @@ impl PowerMonitorApp {
                             "The 5-point median filter affects only the displayed traces. Cursor values, statistics, recordings, and exports always use raw samples.",
                         ));
                     ui.end_row();
+
+                    settings_form_label(ui, language.pick("累计曲线", "Cumulative traces"));
+                    ui.horizontal_wrapped(|ui| {
+                        ui.checkbox(
+                            &mut self.visible_accumulated_series[0],
+                            language.pick("累计能量", "Energy"),
+                        );
+                        ui.checkbox(
+                            &mut self.visible_accumulated_series[1],
+                            language.pick("累计容量", "Capacity"),
+                        );
+                    });
+                    ui.end_row();
                 });
                 if self.time_window != previous_window {
                     self.chart_follow_mode = if self.time_window == TimeWindow::All {
@@ -7760,7 +8401,7 @@ impl eframe::App for PowerMonitorApp {
 
             ui.horizontal(|ui| {
                 if ui
-                    .add_enabled(self.recorder.is_none(), egui::Button::new("清空实时数据"))
+                    .add_enabled(self.can_clear_live_data(), egui::Button::new("清空实时数据"))
                     .clicked()
                 {
                     self.clear_data_confirmation = true;
@@ -8500,11 +9141,32 @@ async fn start_streaming(
     Ok(())
 }
 
+const DEMO_APP_ID: &str = "com.weixun.km003cworkbench.demo";
+
+const fn default_runtime_app_id(demo_mode: bool) -> &'static str {
+    if demo_mode { DEMO_APP_ID } else { APP_ID }
+}
+
+const fn default_runtime_title(demo_mode: bool) -> &'static str {
+    if demo_mode {
+        "KM003C 工作台 · 演示模式"
+    } else {
+        APP_TITLE
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let demo_mode = std::env::args().any(|arg| arg == "--demo");
-    let runtime_app_id = std::env::var("KM003C_NATIVE_APP_ID").unwrap_or_else(|_| APP_ID.to_string());
-    let runtime_title = std::env::var("KM003C_WINDOW_TITLE").unwrap_or_else(|_| APP_TITLE.to_string());
+    let runtime_app_id =
+        std::env::var("KM003C_NATIVE_APP_ID").unwrap_or_else(|_| default_runtime_app_id(demo_mode).to_string());
+    let runtime_title =
+        std::env::var("KM003C_WINDOW_TITLE").unwrap_or_else(|_| default_runtime_title(demo_mode).to_string());
+    let Some(single_instance_guard) = SingleInstanceGuard::acquire(&runtime_app_id)? else {
+        // Connecting to the primary instance is the activation request. The
+        // existing UI consumes it on the next frame and focuses its viewport.
+        return Ok(());
+    };
     init_logging(&runtime_app_id);
     info!(demo_mode, "Starting KM003C Workbench");
 
@@ -8543,7 +9205,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         options,
         Box::new(move |cc| {
             Ok(Box::new(PowerMonitorApp::new_with_context(
-                cc, usb_rx, cmd_tx, demo_mode,
+                cc,
+                usb_rx,
+                cmd_tx,
+                demo_mode,
+                Some(single_instance_guard),
             )))
         }),
     )
@@ -8589,6 +9255,14 @@ mod tests {
         let power_axis = AxisScale::from_visible_max(0.000_04).presentation(MeasurementUnit::Power);
         assert_eq!(power_axis.symbol, "µW");
         assert_ne!(power_axis.format_value(0.000_01), power_axis.format_value(0.000_02));
+
+        let energy_axis = CumulativePresentation::for_maximum(90.0, CumulativeUnit::Energy);
+        assert_eq!(energy_axis.symbol, "mWh");
+        assert_eq!(energy_axis.format_value(90.0), "90.0");
+
+        let capacity_axis = CumulativePresentation::for_maximum(0.05, CumulativeUnit::Capacity);
+        assert_eq!(capacity_axis.symbol, "µAh");
+        assert_ne!(capacity_axis.format_value(0.01), capacity_axis.format_value(0.02));
     }
 
     #[test]
@@ -8789,6 +9463,50 @@ mod tests {
     }
 
     #[test]
+    fn navigator_history_preserves_cumulative_values_for_cursor_readout() {
+        let mut history = NavigatorHistory::with_limit(32);
+        history.push_values_with_accumulated(0.0, [9.0, 1.0, 9.0], [0.0, 0.0]);
+        history.push_values_with_accumulated(1.0, [9.1, 1.1, 10.0], [2_500.0, 125.0]);
+
+        let readout = history.readout_at(1.0).expect("cumulative point should be readable");
+        assert_eq!(readout.cumulative_energy_uwh, 2_500.0);
+        assert_eq!(readout.capacity_uah, 125.0);
+    }
+
+    #[test]
+    fn live_accumulated_traces_use_recording_relative_values() {
+        let (usb_tx, usb_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let mut app = PowerMonitorApp::new(usb_rx, cmd_tx);
+        app.recording_session = true;
+        app.live_plot_origin_seconds = 0.0;
+        app.live_plot_origin_sample_index = Some(0);
+
+        let mut origin = test_measurement(10_000.0);
+        origin.elapsed_us = 0;
+        origin.sample_index = 0;
+        let mut latest = test_measurement(15_000.0);
+        latest.elapsed_us = 1_000_000;
+        latest.sample_index = 1;
+        latest.charge_throughput_uah = 3_000.0;
+        app.data_points.extend([origin, latest]);
+        app.recording_plot_values.insert(origin.sample_index, [0.0, 0.0]);
+        app.recording_plot_values
+            .insert(latest.sample_index, [5_000.0, 2_000.0]);
+
+        let traces = app.source_accumulated_points(
+            NavigatorSelection {
+                start_seconds: 0.0,
+                end_seconds: 1.0,
+            },
+            100,
+        );
+        assert_eq!(traces[0].last(), Some(&[1.0, 5.0]));
+        assert_eq!(traces[1].last(), Some(&[1.0, 2.0]));
+        drop(usb_tx);
+    }
+
+    #[test]
     fn recording_full_session_follow_uses_a_zero_origin_and_expands_each_frame() {
         let (usb_tx, usb_rx) = mpsc::unbounded_channel();
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
@@ -8918,6 +9636,101 @@ mod tests {
         assert_eq!(phase, ConnectionPhase::DeviceBusy);
         assert!(message.contains("关闭其它"));
         assert!(phase.is_terminal_failure());
+
+        let guidance =
+            i18n::connection_guidance(Language::English, ConnectionPhase::DeviceBusy, Some("resource busy")).unwrap();
+        assert!(guidance.contains("Close other POWER-Z"));
+        assert!(i18n::connection_guidance(Language::English, ConnectionPhase::Streaming, None).is_none());
+    }
+
+    #[test]
+    fn standby_readouts_are_unknown_until_a_real_sample_arrives() {
+        let (usb_tx, usb_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let mut app = PowerMonitorApp::new(usb_rx, cmd_tx);
+        app.phase = ConnectionPhase::NoDevice;
+        assert!(!app.instrument_readout_available());
+
+        app.streaming = true;
+        app.phase = ConnectionPhase::Streaming;
+        assert!(!app.instrument_readout_available());
+        app.append_measurements(&[test_measurement(0.0)]);
+        assert!(app.instrument_readout_available());
+
+        app.streaming = false;
+        app.phase = ConnectionPhase::Disconnected;
+        assert!(!app.instrument_readout_available());
+        assert_eq!(app.instrument_readout_status(), "等待设备");
+        drop(usb_tx);
+    }
+
+    #[test]
+    fn sample_rate_is_locked_for_the_whole_recording_session() {
+        let (usb_tx, usb_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let mut app = PowerMonitorApp::new(usb_rx, cmd_tx);
+        assert!(app.can_change_sample_rate());
+        app.recording_session = true;
+        assert!(!app.can_change_sample_rate());
+        app.recording_session = false;
+        assert!(app.can_change_sample_rate());
+        drop(usb_tx);
+    }
+
+    #[test]
+    fn clearing_data_cannot_corrupt_a_paused_recording_session() {
+        let (usb_tx, usb_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let mut app = PowerMonitorApp::new(usb_rx, cmd_tx);
+        app.append_measurements(&[test_measurement(0.0)]);
+        app.recording_session = true;
+        app.recording_paused = true;
+        app.recording_phase = RecordingPhase::Paused;
+
+        assert!(!app.can_clear_live_data());
+        app.clear_data();
+
+        assert_eq!(app.data_points.len(), 1);
+        assert!(app.recording_session);
+        assert!(app.recording_paused);
+        assert_eq!(app.recording_phase, RecordingPhase::Paused);
+        assert!(app.recording_status.contains("请继续记录或先保存"));
+
+        app.recording_session = false;
+        app.recording_paused = false;
+        assert!(app.can_clear_live_data());
+        app.clear_data();
+        assert!(app.data_points.is_empty());
+        assert_eq!(app.recording_phase, RecordingPhase::Idle);
+        drop(usb_tx);
+    }
+
+    #[test]
+    fn demo_mode_uses_an_isolated_native_identity_and_preferences_path() {
+        assert_eq!(default_runtime_app_id(false), APP_ID);
+        assert_eq!(default_runtime_app_id(true), DEMO_APP_ID);
+        assert_ne!(default_runtime_app_id(false), default_runtime_app_id(true));
+        assert!(default_runtime_title(true).contains("演示模式"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn second_instance_notifies_the_primary_without_taking_the_lock() {
+        let unique_id = format!(
+            "{APP_ID}.test.{}.{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let (lock_path, activation_path) = instance_lock_paths(&unique_id);
+        let primary = SingleInstanceGuard::acquire(&unique_id).unwrap().unwrap();
+        assert!(SingleInstanceGuard::acquire(&unique_id).unwrap().is_none());
+        assert!(primary.activation_requested());
+        drop(primary);
+        assert!(!lock_path.exists());
+        assert!(!activation_path.exists());
     }
 
     #[test]
@@ -8954,11 +9767,13 @@ mod tests {
         object.remove("auto_pause_threshold_mw");
         object.remove("auto_pause_delay_ms");
         object.remove("display_filter");
+        object.remove("visible_accumulated_series");
         let restored: AppPreferences = serde_json::from_value(value).unwrap();
         assert!(!restored.auto_pause_enabled);
         assert_eq!(restored.auto_pause_threshold_mw, 100);
         assert_eq!(restored.auto_pause_delay_ms, 3_000);
         assert_eq!(restored.display_filter, DisplayFilter::Median5);
+        assert_eq!(restored.visible_accumulated_series, [true; 2]);
     }
 
     #[test]
@@ -8993,6 +9808,7 @@ mod tests {
         app.append_measurements(&[sample]);
 
         assert!(!app.recording_session);
+        assert!(app.instrument_readout_available());
         assert_eq!(app.instrument_readout_status(), "实时");
         let readout = app.displayed_current_readout();
         assert_eq!(readout.voltage, sample.vbus_uv as f64 / 1_000_000.0);
@@ -9001,7 +9817,8 @@ mod tests {
 
         app.streaming = false;
         app.phase = ConnectionPhase::Disconnected;
-        assert_eq!(app.instrument_readout_status(), "最后读数");
+        assert!(!app.instrument_readout_available());
+        assert_eq!(app.instrument_readout_status(), "等待设备");
         drop(usb_tx);
     }
 

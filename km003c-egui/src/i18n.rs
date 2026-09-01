@@ -100,3 +100,73 @@ pub(crate) fn connection_error(language: Language, raw: &str) -> (ConnectionPhas
 pub(crate) fn original_error_context(language: Language, raw: &str) -> String {
     format!("{}: {raw}", language.pick("原始 USB 错误", "Original USB error"))
 }
+
+/// A monitor-page instruction for the current connection state. Unlike the
+/// compact status chip, this text tells the user what action can recover the
+/// measurement path and is rendered in the active workspace.
+pub(crate) fn connection_guidance(
+    language: Language,
+    phase: ConnectionPhase,
+    raw_error: Option<&str>,
+) -> Option<String> {
+    if let Some(raw_error) = raw_error
+        && matches!(
+            phase,
+            ConnectionPhase::NoDevice | ConnectionPhase::DeviceBusy | ConnectionPhase::ConnectionError
+        )
+    {
+        return Some(connection_error(language, raw_error).1);
+    }
+
+    match phase {
+        ConnectionPhase::Searching => Some(
+            language
+                .pick(
+                    "正在搜索 KM003C；请确认使用可传输数据的 USB 线。",
+                    "Searching for KM003C. Make sure the USB cable supports data transfer.",
+                )
+                .to_string(),
+        ),
+        ConnectionPhase::Connecting => Some(
+            language
+                .pick(
+                    "正在建立 KM003C 采样连接。",
+                    "Establishing the KM003C sampling connection.",
+                )
+                .to_string(),
+        ),
+        ConnectionPhase::NoDevice => Some(
+            language
+                .pick(
+                    "未发现 KM003C。请插入数据线；系统会自动重试。",
+                    "KM003C was not found. Connect a data-capable USB cable; the app will retry automatically.",
+                )
+                .to_string(),
+        ),
+        ConnectionPhase::DeviceBusy => Some(
+            language
+                .pick(
+                    "设备被占用。请关闭其它 POWER-Z/USB 工具后再连接。",
+                    "The device is in use. Close other POWER-Z or USB utilities, then reconnect.",
+                )
+                .to_string(),
+        ),
+        ConnectionPhase::ConnectionError => Some(
+            language
+                .pick(
+                    "连接失败。请重新插拔设备；仍失败时可在设置中启用 USB reset 后重试。",
+                    "Connection failed. Reconnect the device; if it still fails, enable USB reset in Settings and try again.",
+                )
+                .to_string(),
+        ),
+        ConnectionPhase::Disconnected => Some(
+            language
+                .pick(
+                    "KM003C 已断开。重新插入设备或点击“连接”。",
+                    "KM003C is disconnected. Reconnect the device or select Connect.",
+                )
+                .to_string(),
+        ),
+        ConnectionPhase::Streaming => None,
+    }
+}

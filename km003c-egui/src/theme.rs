@@ -14,6 +14,8 @@ pub(crate) const MUTED_TEXT: egui::Color32 = TEXT_SECONDARY;
 pub(crate) const VOLTAGE: egui::Color32 = egui::Color32::from_rgb(0x58, 0xA6, 0xFF);
 pub(crate) const CURRENT: egui::Color32 = egui::Color32::from_rgb(0x3F, 0xB9, 0x50);
 pub(crate) const POWER: egui::Color32 = egui::Color32::from_rgb(0xD2, 0x99, 0x22);
+pub(crate) const ENERGY: egui::Color32 = egui::Color32::from_rgb(0xF7, 0x6E, 0xB6);
+pub(crate) const CAPACITY: egui::Color32 = egui::Color32::from_rgb(0xA3, 0x7A, 0xF2);
 pub(crate) const RECORDING: egui::Color32 = egui::Color32::from_rgb(0xF8, 0x51, 0x49);
 
 pub(crate) fn apply(ctx: &egui::Context) {
@@ -109,6 +111,8 @@ mod tests {
         assert_eq!(VOLTAGE, egui::Color32::from_rgb(0x58, 0xA6, 0xFF));
         assert_eq!(CURRENT, egui::Color32::from_rgb(0x3F, 0xB9, 0x50));
         assert_eq!(POWER, egui::Color32::from_rgb(0xD2, 0x99, 0x22));
+        assert_eq!(ENERGY, egui::Color32::from_rgb(0xF7, 0x6E, 0xB6));
+        assert_eq!(CAPACITY, egui::Color32::from_rgb(0xA3, 0x7A, 0xF2));
         assert_eq!(RECORDING, egui::Color32::from_rgb(0xF8, 0x51, 0x49));
     }
 }

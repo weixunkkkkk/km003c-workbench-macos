@@ -101,6 +101,10 @@ pub(crate) struct AppPreferences {
     pub(crate) auto_pause_delay_ms: u32,
     pub(crate) active_tab: WorkspaceTab,
     pub(crate) visible_series: [bool; 3],
+    /// Visibility of the two cumulative traces on the monitor chart.
+    /// Kept separate from the legacy three-item array so older preferences
+    /// continue to deserialize without a migration prompt.
+    pub(crate) visible_accumulated_series: [bool; 2],
     pub(crate) follow_latest: bool,
     pub(crate) display_filter: DisplayFilter,
 }
@@ -125,6 +129,7 @@ impl Default for AppPreferences {
             auto_pause_delay_ms: 3_000,
             active_tab: WorkspaceTab::Monitor,
             visible_series: [true; 3],
+            visible_accumulated_series: [true; 2],
             follow_latest: true,
             display_filter: DisplayFilter::Median5,
         }
