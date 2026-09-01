@@ -17,7 +17,7 @@ path = "src/main.rs"
 chrono = { version = "0.4.45", features = ["serde"] }
 chrono-tz = "0.10.4"
 km003c-lib = { workspace = true, features = ["usbpd"] }
-eframe = { version = "0.35.0", features = ["persistence"] }
+eframe = { version = "0.36.1", features = ["persistence"] }
 egui-system-fonts = "0.35.0"
 egui_plot = "0.36.0"
 polars = { version = "0.54.4", default-features = false, features = ["csv", "parquet"] }
