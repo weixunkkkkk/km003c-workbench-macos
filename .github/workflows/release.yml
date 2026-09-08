@@ -7,6 +7,11 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Optional tag to validate (manual runs do not publish)"
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -27,22 +32,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Validate tag against workspace version
+      - name: Test release version rules
+        run: python3 -m unittest discover -s Scripts -p test_release_version.py
+
+      - name: Validate tag against application version
         id: version
         shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.release_tag }}
         run: |
-          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml)
-          if [[ -z "$version" ]]; then
-            echo "::error::Could not read the workspace version"
-            exit 1
-          fi
-
-          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" != "v${version}" ]]; then
-            echo "::error::Tag ${GITHUB_REF_NAME} does not match workspace version v${version}"
-            exit 1
-          fi
-
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          python3 Scripts/validate_release_version.py --tag "$RELEASE_TAG" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build ${{ matrix.platform }}
@@ -94,9 +93,9 @@ jobs:
           cargo build --release --locked -p km003c-egui --target aarch64-apple-darwin
           mkdir -p "target/${{ matrix.target }}/release"
           lipo -create \
-            target/x86_64-apple-darwin/release/km003c-egui \
-            target/aarch64-apple-darwin/release/km003c-egui \
-            -output "target/${{ matrix.target }}/release/km003c-egui"
+            target/x86_64-apple-darwin/release/KM003CWorkbench \
+            target/aarch64-apple-darwin/release/KM003CWorkbench \
+            -output "target/${{ matrix.target }}/release/KM003CWorkbench"
 
       - name: Package Unix archive
         if: runner.os != 'Windows'
@@ -104,9 +103,9 @@ jobs:
         run: |
           name="km003c-egui-v${{ needs.validate.outputs.version }}-${{ matrix.platform }}"
           mkdir -p "dist/${name}"
-          cp "target/${{ matrix.target }}/release/km003c-egui" "dist/${name}/"
+          cp "target/${{ matrix.target }}/release/KM003CWorkbench" "dist/${name}/"
           cp README.md LICENSE-MIT LICENSE-APACHE "dist/${name}/"
-          chmod +x "dist/${name}/km003c-egui"
+          chmod +x "dist/${name}/KM003CWorkbench"
           tar -czf "dist/${name}.tar.gz" -C dist "${name}"
 
       - name: Package Windows archive
@@ -115,7 +114,7 @@ jobs:
         run: |
           $name = "km003c-egui-v${{ needs.validate.outputs.version }}-${{ matrix.platform }}"
           New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/km003c-egui.exe" "dist/$name/"
+          Copy-Item "target/${{ matrix.target }}/release/KM003CWorkbench.exe" "dist/$name/"
           Copy-Item "README.md", "LICENSE-MIT", "LICENSE-APACHE" "dist/$name/"
           Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip" -Force
 
@@ -127,7 +126,7 @@ jobs:
 
   release:
     name: Publish release
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     needs:
       - validate
       - build
