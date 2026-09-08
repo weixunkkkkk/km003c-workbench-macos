@@ -5,6 +5,53 @@ use crate::measurement::PlotMetric;
 use crate::recording::RecordingFormat;
 use crate::{SampleRateOption, TimeWindow};
 
+/// Visual skin selection.  This is deliberately presentation-only: changing
+/// it never changes the USB session, recording state, or plotted samples.
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum SkinId {
+    /// The original restrained instrument palette.
+    #[default]
+    Industrial,
+    /// A low-saturation navy/cyan palette with the embedded Japanese-style
+    /// character wallpaper selected for this workbench.
+    CleanAnime,
+}
+
+impl SkinId {
+    pub(crate) const ALL: [Self; 2] = [Self::Industrial, Self::CleanAnime];
+
+    pub(crate) const fn localized_label(self, language: Language) -> &'static str {
+        match self {
+            Self::Industrial => language.pick("工业仪器", "Industrial instrument"),
+            Self::CleanAnime => language.pick("日系风格", "Japanese style"),
+        }
+    }
+
+    /// A compact label for fixed-width toolbar controls.  The full label is
+    /// still used in settings, while this version keeps the header stable in
+    /// both locales and at the compact window density.
+    pub(crate) const fn localized_short_label(self, language: Language) -> &'static str {
+        match self {
+            Self::Industrial => language.pick("工业仪器", "Industrial"),
+            Self::CleanAnime => language.pick("日系风格", "Japanese"),
+        }
+    }
+
+    pub(crate) const fn localized_description(self, language: Language) -> &'static str {
+        match self {
+            Self::Industrial => language.pick(
+                "灰阶专业仪表主题，适合长时间测量。",
+                "A restrained grayscale instrument theme for long measurement sessions.",
+            ),
+            Self::CleanAnime => language.pick(
+                "低饱和深色界面，铺陈日系角色壁纸。",
+                "A low-saturation instrument interface with a Japanese character wallpaper.",
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum AutoCaptureMetric {
     #[default]
@@ -70,6 +117,41 @@ pub(crate) enum DisplayFilter {
     Median5,
 }
 
+/// Controls how the monitor plot maps each measurement channel to its
+/// vertical coordinate.  Both modes keep the raw engineering values in the
+/// cursor, cards, statistics and exported files; this only changes the axis
+/// presentation.
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum ChartScaleMode {
+    #[default]
+    Actual,
+    Relative,
+}
+
+impl ChartScaleMode {
+    pub(crate) const ALL: [Self; 2] = [Self::Actual, Self::Relative];
+
+    pub(crate) const fn localized_label(self, language: Language) -> &'static str {
+        match self {
+            Self::Actual => language.pick("实际刻度", "Engineering scale"),
+            Self::Relative => language.pick("相对量程", "Relative range"),
+        }
+    }
+
+    pub(crate) const fn localized_description(self, language: Language) -> &'static str {
+        match self {
+            Self::Actual => language.pick(
+                "显示 V、A、W 的真实工程单位刻度。",
+                "Show real engineering-unit ticks for V, A, and W.",
+            ),
+            Self::Relative => language.pick(
+                "每条曲线独立显示 0–100%，游标仍显示真实值。",
+                "Normalize each trace to 0–100%; the cursor still shows real values.",
+            ),
+        }
+    }
+}
+
 impl DisplayFilter {
     pub(crate) const fn localized_label(self, language: Language) -> &'static str {
         match self {
@@ -85,6 +167,9 @@ impl DisplayFilter {
 #[serde(default)]
 pub(crate) struct AppPreferences {
     pub(crate) language: Language,
+    /// Presentation-only skin.  `serde(default)` keeps older preference
+    /// files on the industrial theme when this field is absent.
+    pub(crate) skin: SkinId,
     pub(crate) selected_rate: SampleRateOption,
     pub(crate) time_window: TimeWindow,
     pub(crate) plot_metrics: [PlotMetric; 3],
@@ -107,12 +192,14 @@ pub(crate) struct AppPreferences {
     pub(crate) visible_accumulated_series: [bool; 2],
     pub(crate) follow_latest: bool,
     pub(crate) display_filter: DisplayFilter,
+    pub(crate) chart_scale_mode: ChartScaleMode,
 }
 
 impl Default for AppPreferences {
     fn default() -> Self {
         Self {
             language: Language::SimplifiedChinese,
+            skin: SkinId::Industrial,
             selected_rate: SampleRateOption::Sps50,
             time_window: TimeWindow::Sec30,
             plot_metrics: [PlotMetric::Voltage, PlotMetric::Current, PlotMetric::Power],
@@ -132,6 +219,7 @@ impl Default for AppPreferences {
             visible_accumulated_series: [true; 2],
             follow_latest: true,
             display_filter: DisplayFilter::Median5,
+            chart_scale_mode: ChartScaleMode::Actual,
         }
     }
 }
