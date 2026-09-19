@@ -250,6 +250,47 @@ pub struct OfflineLog {
     pub samples: Vec<OfflineLogSample>,
 }
 
+// Endpoint totals are a consistency check, not a checksum. A real device log
+// reported 5181760/100579515 in its last row and 5181772/100579761 in
+// metadata. Permit at most 10 ppm (0.001%) or one wire unit for rounding.
+// This is a conservative compatibility allowance, not an established timing
+// model of the firmware. Keep both values losslessly; reject sign changes and
+// larger mismatches so selecting a different log is still detected.
+fn accumulator_matches(sample: i32, metadata: i32) -> bool {
+    if sample != 0 && metadata != 0 && sample.signum() != metadata.signum() {
+        return false;
+    }
+    let sample = i64::from(sample);
+    let metadata = i64::from(metadata);
+    let tolerance = (sample.abs().max(metadata.abs()) / 100_000).max(1);
+    (sample - metadata).abs() <= tolerance
+}
+
+// Some device summaries include a fractional final interval not stored as a
+// sample. Accept only a forward continuation bounded by the last stored step
+// in BOTH counters, with consistent interval fractions (within 5% of a step).
+// This is a conservative consistency check, not proof of firmware timing.
+// Never synthesize a row or replace the original counters with the summary.
+fn plausible_final_interval(metadata: &LogMetadata, samples: &[OfflineLogSample]) -> bool {
+    if samples.len() < 2 || metadata.interval.get::<second>() <= 0.0 {
+        return false;
+    }
+    let last = samples[samples.len() - 1].raw();
+    let previous = samples[samples.len() - 2].raw();
+    let q_step = i64::from(last.charge_uah) - i64::from(previous.charge_uah);
+    let e_step = i64::from(last.energy_uwh) - i64::from(previous.energy_uwh);
+    let q_tail = i64::from(metadata.final_charge_raw_uah()) - i64::from(last.charge_uah);
+    let e_tail = i64::from(metadata.final_energy_raw_uwh()) - i64::from(last.energy_uwh);
+    let forward = |tail: i64, step: i64| step != 0 && tail.signum() == step.signum() && tail.abs() <= step.abs();
+    if !forward(q_tail, q_step) || !forward(e_tail, e_step) {
+        return false;
+    }
+    let q_step = i128::from(q_step.abs());
+    let e_step = i128::from(e_step.abs());
+    let difference = (i128::from(q_tail.abs()) * e_step - i128::from(e_tail.abs()) * q_step).abs();
+    difference * 20 <= q_step * e_step
+}
+
 impl OfflineLog {
     pub fn from_bytes(metadata: LogMetadata, bytes: &[u8]) -> Result<Self, KMError> {
         let expected = metadata.data_size() as usize;
@@ -271,7 +312,10 @@ impl OfflineLog {
 
         if let Some(last) = samples.last() {
             let raw = last.raw();
-            if raw.charge_uah != metadata.final_charge_raw_uah() || raw.energy_uwh != metadata.final_energy_raw_uwh() {
+            if !(accumulator_matches(raw.charge_uah, metadata.final_charge_raw_uah())
+                && accumulator_matches(raw.energy_uwh, metadata.final_energy_raw_uwh()))
+                && !plausible_final_interval(&metadata, &samples)
+            {
                 return Err(KMError::InvalidPacket(format!(
                     "Offline log final accumulators do not match metadata: sample has charge={} µAh and energy={} µWh, metadata has charge={} µAh and energy={} µWh",
                     raw.charge_uah,
@@ -279,6 +323,15 @@ impl OfflineLog {
                     metadata.final_charge_raw_uah(),
                     metadata.final_energy_raw_uwh()
                 )));
+            }
+            if raw.charge_uah != metadata.final_charge_raw_uah() || raw.energy_uwh != metadata.final_energy_raw_uwh() {
+                tracing::warn!(
+                    sample_charge_uah = raw.charge_uah,
+                    metadata_charge_uah = metadata.final_charge_raw_uah(),
+                    sample_energy_uwh = raw.energy_uwh,
+                    metadata_energy_uwh = metadata.final_energy_raw_uwh(),
+                    "Offline summary differs within rounding or final-interval bounds; original values retained"
+                );
             }
         }
 
@@ -368,6 +421,78 @@ mod tests {
         let wrong_sample = hex::decode("81494c0021f0e2ff56ebffffb998ffff").unwrap();
         let error = OfflineLog::from_bytes(metadata, &wrong_sample).unwrap_err();
         assert!(error.to_string().contains("final accumulators do not match"));
+    }
+
+    #[test]
+    fn accepts_reported_endpoint_drift_without_changing_data() {
+        for sign in [1, -1] {
+            let mut metadata = LogMetadata::from_bytes(&hex::decode(CAPTURED_METADATA).unwrap()).unwrap();
+            metadata.sample_count = 1;
+            metadata.final_charge = ElectricCharge::new::<microampere_hour>(f64::from(sign * 5_181_772));
+            metadata.final_energy = Energy::new::<microwatt_hour>(f64::from(sign * 100_579_761));
+            let sample = OfflineLogSampleRaw {
+                voltage_uv: 20_000_000,
+                current_ua: sign * 1_000_000,
+                charge_uah: sign * 5_181_760,
+                energy_uwh: sign * 100_579_515,
+            };
+            let bytes = OfflineLogSampleWire::from(sample).as_bytes().to_vec();
+            let log = OfflineLog::from_bytes(metadata.clone(), &bytes).unwrap();
+            assert_eq!(log.samples[0].raw(), sample);
+            assert_eq!(log.metadata, metadata);
+            assert_eq!(log.to_bytes(), bytes);
+        }
+    }
+
+    #[test]
+    fn endpoint_tolerance_is_bounded_and_overflow_safe() {
+        assert!(accumulator_matches(0, 0));
+        assert!(accumulator_matches(0, 1));
+        assert!(!accumulator_matches(0, 2));
+        assert!(!accumulator_matches(-1, 1));
+        assert!(accumulator_matches(1_000_000, 1_000_010));
+        assert!(!accumulator_matches(1_000_000, 1_000_011));
+        assert!(!accumulator_matches(i32::MIN, i32::MAX));
+        assert!(accumulator_matches(i32::MIN, i32::MIN + 1));
+    }
+
+    #[test]
+    fn real_short_recording_preserves_fractional_tail_without_fabricating_samples() {
+        let metadata = LogMetadata::from_bytes(
+            &hex::decode(
+                "4130312e640000000000000000000000450a120010270000aa0000001b77feff96fcf1ff007500000000000011747fc1",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let bytes = hex::decode(concat!(
+            "bd5b4e00e9c5f8ff7bffffff52fdffff85e18700947deeffe3f0ffffd9abffff",
+            "917e8c000b3cddffa3deffff8b05ffff80c28d006958dbffe9c5ffff4021feff",
+            "c6238f00101fd9ff06acffff8230fdffc6c68d00118edcff6692ffffc841fcff",
+            "84dd8d00b0dbddffb479ffff405cfbff80fb8d003f8fdeff7e61ffff147bfaff",
+            "3ffc8d00cdd8deff8e49ffff629cf9ffccda8d007186ddff2131ffff8eb9f8ff",
+            "d5068e00dc35dfffeb18ffff6ad8f7ffa1158e001484dfffca01ffff2d01f7ff",
+            "06b28c00556fdeffb9e9feff6d21f6ff082d8e00b76edfff6ad2feff0349f5ff",
+            "fe188d00be40e3ff49bdfeff6d85f4ffb4248d00458ce3ffcba8feff03c8f3ff",
+            "29138d00461be4ff9294feff0b0df3ffdb278d001402e4ff8380feff9753f2ff"
+        ))
+        .unwrap();
+        let log = OfflineLog::from_bytes(metadata.clone(), &bytes).unwrap();
+        assert_eq!(log.samples.len(), 18);
+        assert_eq!(log.samples.last().unwrap().raw().charge_uah, -98_173);
+        assert_eq!(log.samples.last().unwrap().raw().energy_uwh, -896_105);
+        assert_eq!(log.metadata, metadata);
+        assert_eq!(log.to_bytes(), bytes);
+        assert!(plausible_final_interval(&metadata, &log.samples));
+        let mut wrong = metadata.clone();
+        wrong.final_charge = ElectricCharge::new::<microampere_hour>(-110_000.0);
+        assert!(OfflineLog::from_bytes(wrong, &bytes).is_err());
+        let mut backwards = metadata.clone();
+        backwards.final_charge = ElectricCharge::new::<microampere_hour>(-97_000.0);
+        assert!(OfflineLog::from_bytes(backwards, &bytes).is_err());
+        let mut inconsistent = metadata;
+        inconsistent.final_energy = Energy::new::<microwatt_hour>(-898_000.0);
+        assert!(OfflineLog::from_bytes(inconsistent, &bytes).is_err());
     }
 
     #[test]

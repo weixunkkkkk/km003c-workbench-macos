@@ -1356,6 +1356,12 @@ impl TimeWindow {
     }
 }
 
+struct RecoveryListCache {
+    updated: Instant,
+    sessions: Vec<(PathBuf, RecordingSessionManifestV1)>,
+    files: Vec<PathBuf>,
+}
+
 struct PowerMonitorApp {
     /// User-facing UI language. Protocol names and engineering units remain standardized.
     language: Language,
@@ -1435,6 +1441,8 @@ struct PowerMonitorApp {
     active_tab: WorkspaceTab,
     settings_open: bool,
     settings_page: SettingsPage,
+    recovery_cache: Option<RecoveryListCache>,
+    recovery_scan: Option<std::sync::mpsc::Receiver<RecoveryListCache>>,
     advanced_analysis_open: bool,
     visible_series: [bool; 3],
     /// Cumulative energy and capacity traces shown on the monitor chart.
@@ -1472,6 +1480,7 @@ struct PowerMonitorApp {
     /// import-style summary header.
     last_recording_metadata: Option<RecordingSessionMetadataV1>,
     recording_phase: RecordingPhase,
+    restart_requested: bool,
     pending_save_destination: Option<PathBuf>,
     pause_intervals: Vec<PauseInterval>,
     active_pause_started_at: Option<f64>,
@@ -1657,6 +1666,8 @@ impl PowerMonitorApp {
             active_tab: WorkspaceTab::Monitor,
             settings_open: false,
             settings_page: SettingsPage::General,
+            recovery_cache: None,
+            recovery_scan: None,
             advanced_analysis_open: false,
             visible_series: [true; 3],
             visible_accumulated_series: [true; 2],
@@ -1679,6 +1690,7 @@ impl PowerMonitorApp {
             recording_session_metadata: None,
             last_recording_metadata: None,
             recording_phase: RecordingPhase::Idle,
+            restart_requested: false,
             pending_save_destination: None,
             pause_intervals: Vec::new(),
             active_pause_started_at: None,
@@ -2020,6 +2032,17 @@ impl PowerMonitorApp {
                 UsbMessage::OfflineLogDownloaded(log) => {
                     let samples = log.samples.len();
                     let filename = log.metadata.filename_lossy().into_owned();
+                    let endpoint_note = log.samples.last().and_then(|sample| {
+                        let raw = sample.raw();
+                        let charge_delta = i64::from(log.metadata.final_charge_raw_uah()) - i64::from(raw.charge_uah);
+                        let energy_delta = i64::from(log.metadata.final_energy_raw_uwh()) - i64::from(raw.energy_uwh);
+                        (charge_delta != 0 || energy_delta != 0).then(|| {
+                            self.language.pick(
+                                &format!("；设备摘要与末点相差 {charge_delta} µAh / {energy_delta} µWh（通过舍入/末间隔检查，导出保留原始采样）"),
+                                &format!("; metadata differs from the last sample by {charge_delta} µAh / {energy_delta} µWh (rounding/final-interval check passed; exports retain original samples)"),
+                            ).to_owned()
+                        })
+                    });
                     self.offline_view = Some(Arc::new(OfflineRecordingView::new(log)));
                     self.offline_device_metadata = self.device_state.as_ref().map(|state| RecordingMetadata {
                         model: state.info.model.clone(),
@@ -2028,6 +2051,9 @@ impl PowerMonitorApp {
                     });
                     self.offline_busy = false;
                     self.offline_status = format!("已下载 {samples} 个采样点：{filename}");
+                    if let Some(note) = endpoint_note {
+                        self.offline_status.push_str(&note);
+                    }
                     self.plot_source = PlotSource::Offline;
                     self.time_window = TimeWindow::All;
                     self.cursor_readout = None;
@@ -2043,6 +2069,15 @@ impl PowerMonitorApp {
                 }
                 UsbMessage::OfflineOperationFailed(error) => {
                     self.offline_busy = false;
+                    // Never leave a previous log exportable as if this request succeeded.
+                    self.offline_view = None;
+                    self.offline_device_metadata = None;
+                    if self.plot_source == PlotSource::Offline {
+                        self.plot_source = PlotSource::Live;
+                        self.cursor_readout = None;
+                        self.cursor_pinned = false;
+                        self.reset_plots_requested = true;
+                    }
                     self.offline_status = format!("离线记录操作失败：{error}");
                 }
                 UsbMessage::StreamingStopped => {
@@ -2989,6 +3024,34 @@ impl PowerMonitorApp {
         info!("Data cleared");
     }
 
+    fn request_new_measurement(&mut self) {
+        if self.recording_phase == RecordingPhase::Finalizing || self.restart_requested {
+            return;
+        }
+        if self.recording_session {
+            self.stop_recording();
+        }
+        self.restart_requested = true;
+    }
+
+    fn finish_measurement_restart(&mut self) {
+        if !self.restart_requested || self.recorder.is_some() || !self.finalizing_segments.is_empty() {
+            return;
+        }
+        self.restart_requested = false;
+        self.finish_recording_session();
+        self.recording_manifest = None;
+        self.recording_session_directory = None;
+        self.recording_session_metadata = None;
+        self.last_recording_metadata = None;
+        self.pause_intervals.clear();
+        self.close_imported_recording();
+        self.plot_source = PlotSource::Live;
+        self.clear_data();
+        self.recovery_cache = None;
+        self.recovery_scan = None;
+    }
+
     fn clear_pd_log(&mut self) {
         self.pd_log.clear();
         self.pd_trace_log.clear();
@@ -3927,7 +3990,7 @@ impl PowerMonitorApp {
     }
 
     fn export_offline_log(&mut self) {
-        if self.offline_export.is_some() {
+        if self.offline_export.is_some() || self.offline_busy {
             return;
         }
         let (Some(view), Some(device)) = (&self.offline_view, &self.offline_device_metadata) else {
@@ -4534,6 +4597,7 @@ impl PowerMonitorApp {
             ));
         }
         let usb_backlog = self.process_messages();
+        self.finish_measurement_restart();
         self.update_demo_data();
         if usb_backlog {
             ctx.request_repaint();
@@ -5100,12 +5164,36 @@ impl PowerMonitorApp {
                         self.reset_plots_requested = true;
                     }
 
-                    if density != ToolbarDensity::Full {
+                    if ui
+                        .add(egui::Button::new(language.pick("离线导入", "On-device import"))
+                            .min_size(egui::vec2(if compact { 76.0 } else { 112.0 }, 30.0)))
+                        .on_hover_text(language.pick(
+                            "从 KM003C 下载已保存的离线记录；请先在设备上选择记录。",
+                            "Download a saved log from KM003C. Select the recording on the device first.",
+                        ))
+                        .clicked()
+                    {
+                        self.settings_page = SettingsPage::DataAndDevice;
+                        self.settings_open = true;
+                        self.request_offline_catalog();
+                    }
+
+                    {
                         ui.allocate_ui_with_layout(
                             egui::vec2(if narrow { 64.0 } else { 72.0 }, 30.0),
                             egui::Layout::left_to_right(egui::Align::Center),
                             |ui| {
                                 ui.menu_button(language.pick("更多", "More"), |ui| {
+                                    if ui.add_enabled(
+                                        !self.restart_requested && self.recording_phase != RecordingPhase::Finalizing,
+                                        egui::Button::new(language.pick("重新测量", "New measurement")),
+                                    ).on_hover_text(language.pick(
+                                        "保留当前记录到恢复列表，清空视图并准备一段新测量。",
+                                        "Keep the current recording in recovery, clear the view, and prepare a new measurement.",
+                                    )).clicked() {
+                                        self.request_new_measurement();
+                                        ui.close();
+                                    }
                                     if ui
                                         .add_enabled(
                                             can_export,
@@ -5653,8 +5741,8 @@ impl PowerMonitorApp {
                 .to_string(),
             PowerProtocolState::TraditionalUnconfirmed => language
                 .pick(
-                    "协议未确认 · 不推测 QC / VOOC / UFCS",
-                    "Protocol unconfirmed · QC / VOOC / UFCS not inferred",
+                    "未捕获完整协商 · 请在开始采集后重新连接被测设备",
+                    "Negotiation not captured · Reconnect the device under test after capture starts",
                 )
                 .to_string(),
             PowerProtocolState::Waiting => language
@@ -7900,16 +7988,24 @@ impl PowerMonitorApp {
                                 ) {
                                     self.plot_source = PlotSource::Live;
                                 }
-                                segments.add_enabled_ui(self.offline_view.is_some(), |segments| {
-                                    if settings_segment(
-                                        segments,
-                                        self.plot_source == PlotSource::Offline,
-                                        segment_width,
-                                        language.pick("设备离线", "On-device"),
-                                    ) {
-                                        self.plot_source = PlotSource::Offline;
-                                    }
-                                });
+                                segments.add_enabled_ui(
+                                    self.device_state.is_some() || self.offline_view.is_some(),
+                                    |segments| {
+                                        if settings_segment(
+                                            segments,
+                                            self.plot_source == PlotSource::Offline,
+                                            segment_width,
+                                            language.pick("设备离线", "On-device"),
+                                        ) {
+                                            self.settings_page = SettingsPage::DataAndDevice;
+                                            if self.offline_view.is_some() {
+                                                self.plot_source = PlotSource::Offline;
+                                            } else {
+                                                self.request_offline_catalog();
+                                            }
+                                        }
+                                    },
+                                );
                                 segments.add_enabled_ui(self.imported_recording.is_some(), |segments| {
                                     if settings_segment(
                                         segments,
@@ -8192,9 +8288,42 @@ impl PowerMonitorApp {
                 );
             });
 
-            let pending_directory = application_recordings_directory().join("Pending");
-            let recoverable_sessions = discover_recoverable_sessions(&pending_directory);
-            let recoverable = recoverable_recordings();
+            if let Some(scan) = &self.recovery_scan {
+                match scan.try_recv() {
+                    Ok(cache) => {
+                        self.recovery_cache = Some(cache);
+                        self.recovery_scan = None;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => self.recovery_scan = None,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                }
+            }
+            if self.recovery_scan.is_none()
+                && self
+                    .recovery_cache
+                    .as_ref()
+                    .is_none_or(|cache| cache.updated.elapsed() >= Duration::from_secs(5))
+            {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let ctx = ui.ctx().clone();
+                std::thread::spawn(move || {
+                    let _ = tx.send(RecoveryListCache {
+                        updated: Instant::now(),
+                        sessions: discover_recoverable_sessions(&application_recordings_directory().join("Pending")),
+                        files: recoverable_recordings(),
+                    });
+                    ctx.request_repaint();
+                });
+                self.recovery_scan = Some(rx);
+            }
+            let recoverable_sessions = self
+                .recovery_cache
+                .as_ref()
+                .map_or_else(Vec::new, |cache| cache.sessions.clone());
+            let recoverable = self
+                .recovery_cache
+                .as_ref()
+                .map_or_else(Vec::new, |cache| cache.files.clone());
             if !recoverable_sessions.is_empty() || !recoverable.is_empty() {
                 let title = format!(
                     "{} ({})",
@@ -8556,8 +8685,12 @@ impl PowerMonitorApp {
             settings_section(
                 ui,
                 language.pick("设备离线记录", "On-device recordings"),
-                false,
+                true,
                 |ui| {
+                    ui.label(language.pick(
+                        "先在 KM003C 上选择已保存的离线记录，再刷新并下载。录制期间请先结束当前会话。",
+                        "Select a saved log on the KM003C, then refresh and download. Finish the current recording first.",
+                    ));
                     let form = SettingsFormMetrics::for_available_width(ui.available_width());
                     egui::Grid::new("settings_offline_controls")
                         .num_columns(2)
@@ -10111,6 +10244,26 @@ mod tests {
     }
 
     #[test]
+    fn new_measurement_resets_paused_session_without_reopening_app() {
+        let (_usb_tx, usb_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let mut app = PowerMonitorApp::new(usb_rx, cmd_tx);
+        app.recording_session = true;
+        app.recording_paused = true;
+        app.recording_phase = RecordingPhase::Paused;
+        app.last_recording_duration = Some(Duration::from_secs(43));
+        app.total_samples = 2153;
+        app.request_new_measurement();
+        app.finish_measurement_restart();
+        assert_eq!(app.recording_phase, RecordingPhase::Idle);
+        assert!(!app.recording_session);
+        assert!(!app.recording_paused);
+        assert!(app.can_clear_live_data());
+        assert_eq!(app.displayed_recording_duration(), Duration::ZERO);
+        assert_eq!(app.total_samples, 0);
+    }
+
+    #[test]
     fn settings_navigation_has_complete_bilingual_labels() {
         for page in SettingsPage::ALL {
             assert!(!page.localized_label(Language::SimplifiedChinese).is_empty());
@@ -10543,6 +10696,27 @@ mod tests {
         assert!(app.offline_catalog.is_empty());
         assert_eq!(app.offline_selected, None);
         assert!(app.offline_status.contains("没有离线记录"));
+    }
+
+    #[test]
+    fn failed_offline_download_cannot_export_the_previous_log() {
+        let (usb_tx, usb_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let mut app = PowerMonitorApp::new(usb_rx, cmd_tx);
+        app.offline_view = Some(Arc::new(captured_test_view()));
+        app.plot_source = PlotSource::Offline;
+        app.offline_busy = true;
+        usb_tx
+            .send(UsbMessage::OfflineOperationFailed("mismatched endpoint".to_owned()))
+            .unwrap();
+        app.process_messages();
+        assert!(app.offline_view.is_none());
+        assert!(app.offline_device_metadata.is_none());
+        assert!(!app.offline_busy);
+        assert_eq!(app.plot_source, PlotSource::Live);
+        app.export_offline_log();
+        assert!(app.offline_export.is_none());
+        assert!(app.offline_status.contains("请先下载"));
     }
 
     #[test]
