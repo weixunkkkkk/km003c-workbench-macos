@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-20260919-2] - 2026-09-19
+
+This macOS application revision keeps the App version at `0.1.0` and uses a
+date-suffixed tag to distinguish distributable builds. The Rust workspace and
+the KM003C 23-column recording contract remain compatible.
+
+### Added
+
+- A dedicated record manager for recoverable sessions and KM003C on-device
+  recordings, with fixed action columns and stable selection after refresh.
+- Export dispatch based on the active source: live data, on-device logs, or an
+  unchanged copy of an imported CSV/Parquet file with its metadata sidecar.
+- A read-only offline snapshot example and a dated UI/offline acceptance record.
+
+### Changed
+
+- Simplified settings navigation into shorter bilingual categories and moved
+  record management out of the configuration pages.
+- Kept the current source, quality information, and export controls aligned
+  when switching between live, on-device, and imported data.
+- Adjusted the monitor layout, chart height reservation, labels, and compact
+  controls so language changes and long filenames do not push controls out of
+  the window.
+
+### Fixed
+
+- Offline catalog refresh now preserves the selected filename and data offset,
+  falling back to the first entry only when the previous entry disappears.
+- A failed offline download clears the previous offline view and export source,
+  preventing an earlier log from being exported as the new selection.
+- Endpoint totals that differ only by a bounded rounding/final-interval tail
+  are accepted without changing or fabricating raw samples.
+- Imported recordings can be returned to live measurements without leaving a
+  stale chart source or allowing an overwrite of the original file.
+
+### Validation
+
+- `cargo test --locked`: 99 GUI tests passed, 3 hardware/external-artifact
+  tests ignored, and all library/integration tests passed.
+- `cargo fmt --all -- --check`, strict Clippy, Universal App, DMG, and ad-hoc
+  signature checks passed.
+- Latest DMG SHA-256:
+  `5505f1f6f8606a952b6c2223316a1c39b32d174f4b545eab28d1d68e74dd077c`.
+
+The release is published as
+[`v0.1.0-20260919-2`](https://github.com/weixunkkkkk/km003c-workbench-macos/releases/tag/v0.1.0-20260919-2).
+
 ## [0.3.0] - 2026-07-22
 
 ### Added
@@ -91,5 +138,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Parsing of chained AdcQueue/PD responses and legacy PD connection events.
 
 [Unreleased]: https://github.com/okhsunrog/km003c-rs/compare/v0.3.0...HEAD
+[0.1.0-20260919-2]: https://github.com/weixunkkkkk/km003c-workbench-macos/releases/tag/v0.1.0-20260919-2
 [0.3.0]: https://github.com/okhsunrog/km003c-rs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/okhsunrog/km003c-rs/releases/tag/v0.2.0

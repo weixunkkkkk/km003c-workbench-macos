@@ -8,6 +8,7 @@ mod pd_decoder;
 mod pd_trace_view;
 mod preferences;
 mod recording;
+mod recording_copy;
 mod recording_import;
 mod recording_session;
 mod sleep_assertion;
@@ -231,31 +232,28 @@ impl SettingsPage {
 
     const fn localized_label(self, language: Language) -> &'static str {
         match self {
-            Self::General => language.pick("通用设置", "General"),
-            Self::Recording => language.pick("录制与恢复", "Recording & recovery"),
-            Self::Chart => language.pick("图表与显示", "Chart & display"),
-            Self::DataAndDevice => language.pick("数据与设备", "Data & device"),
+            Self::General => language.pick("通用", "General"),
+            Self::Recording => language.pick("录制", "Recording"),
+            Self::Chart => language.pick("图表", "Charts"),
+            Self::DataAndDevice => language.pick("设备", "Device"),
             Self::Diagnostics => language.pick("诊断与关于", "Diagnostics & about"),
         }
     }
 
     const fn localized_description(self, language: Language) -> &'static str {
         match self {
-            Self::General => language.pick(
-                "设置界面语言、当前数据源和 KM003C 连接选项。",
-                "Choose the interface language, data source, and KM003C connection options.",
-            ),
+            Self::General => language.pick("选择界面语言和皮肤。", "Choose the interface language and skin."),
             Self::Recording => language.pick(
-                "管理录制格式、睡眠保护、自动暂停和待恢复会话。",
-                "Manage recording format, sleep protection, automatic pause, and recoverable sessions.",
+                "设置文件格式、睡眠保护和自动暂停／继续。",
+                "Set the file format, sleep protection, and automatic pause/resume.",
             ),
             Self::Chart => language.pick(
-                "调整时间范围、坐标显示、屏幕降噪和高级分析曲线。",
-                "Adjust the time range, axis display, smoothing, and advanced-analysis traces.",
+                "调整时间范围、坐标显示、屏幕降噪和累计曲线。",
+                "Adjust the time range, axis display, smoothing, and cumulative traces.",
             ),
             Self::DataAndDevice => language.pick(
-                "检查数据完整度，并下载 KM003C 内置存储中的记录。",
-                "Inspect data integrity and download recordings stored on the KM003C.",
+                "查看设备信息和高级连接选项。",
+                "View device information and advanced connection options.",
             ),
             Self::Diagnostics => language.pick(
                 "查看版本、日志位置、开源许可和项目来源。",
@@ -263,6 +261,12 @@ impl SettingsPage {
             ),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordManagerPage {
+    Recovery,
+    OnDevice,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1441,6 +1445,8 @@ struct PowerMonitorApp {
     active_tab: WorkspaceTab,
     settings_open: bool,
     settings_page: SettingsPage,
+    record_manager: Option<RecordManagerPage>,
+    imported_copy: Option<std::sync::mpsc::Receiver<Result<PathBuf, String>>>,
     recovery_cache: Option<RecoveryListCache>,
     recovery_scan: Option<std::sync::mpsc::Receiver<RecoveryListCache>>,
     advanced_analysis_open: bool,
@@ -1666,6 +1672,8 @@ impl PowerMonitorApp {
             active_tab: WorkspaceTab::Monitor,
             settings_open: false,
             settings_page: SettingsPage::General,
+            record_manager: None,
+            imported_copy: None,
             recovery_cache: None,
             recovery_scan: None,
             advanced_analysis_open: false,
@@ -2026,7 +2034,15 @@ impl PowerMonitorApp {
                     } else {
                         format!("已加载 {} 条离线记录", catalog.len())
                     };
-                    self.offline_selected = (!catalog.is_empty()).then_some(0);
+                    self.offline_selected = self
+                        .offline_selected
+                        .and_then(|index| self.offline_catalog.get(index))
+                        .and_then(|selected| {
+                            catalog.iter().position(|entry| {
+                                entry.filename_raw == selected.filename_raw && entry.data_offset == selected.data_offset
+                            })
+                        })
+                        .or_else(|| (!catalog.is_empty()).then_some(0));
                     self.offline_catalog = catalog;
                 }
                 UsbMessage::OfflineLogDownloaded(log) => {
@@ -2056,6 +2072,7 @@ impl PowerMonitorApp {
                     }
                     self.plot_source = PlotSource::Offline;
                     self.time_window = TimeWindow::All;
+                    self.record_manager = None;
                     self.cursor_readout = None;
                     self.cursor_pinned = false;
                     self.reset_plots_requested = true;
@@ -2135,6 +2152,7 @@ impl PowerMonitorApp {
         self.maybe_retry_connection();
         self.poll_recording();
         self.poll_offline_export();
+        self.poll_imported_copy();
         self.poll_recording_import();
         processed_messages == MAX_USB_MESSAGES_PER_FRAME
     }
@@ -3539,6 +3557,90 @@ impl PowerMonitorApp {
             .to_string();
     }
 
+    fn can_export_current_source(&self) -> bool {
+        if self.recorder.is_some() || self.offline_export.is_some() || self.imported_copy.is_some() {
+            return false;
+        }
+        match self.plot_source {
+            PlotSource::Live => self.device_state.is_some() && !self.data_points.is_empty(),
+            PlotSource::Offline => {
+                !self.offline_busy && self.offline_view.is_some() && self.offline_device_metadata.is_some()
+            }
+            PlotSource::Imported => self.imported_recording.is_some(),
+        }
+    }
+
+    fn export_current_source(&mut self) {
+        if !self.can_export_current_source() {
+            return;
+        }
+        match self.plot_source {
+            PlotSource::Live => self.export_buffer(),
+            PlotSource::Offline => self.export_offline_log(),
+            PlotSource::Imported => {
+                let Some(recording) = &self.imported_recording else {
+                    return;
+                };
+                let extension = recording.path.extension().and_then(|s| s.to_str()).unwrap_or("parquet");
+                let stem = recording
+                    .path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("recording");
+                let Some(mut path) = rfd::FileDialog::new()
+                    .set_title(self.language.pick("另存原格式副本", "Save an unchanged copy"))
+                    .add_filter("KM003C", &[extension])
+                    .set_file_name(format!("{stem}-copy.{extension}"))
+                    .save_file()
+                else {
+                    return;
+                };
+                path.set_extension(extension);
+                self.imported_copy = Some(recording_copy::start(
+                    recording.path.clone(),
+                    path,
+                    recording.metadata.clone(),
+                ));
+                self.import_status = self.language.pick("正在另存副本…", "Saving a copy…").to_string();
+            }
+        }
+    }
+
+    fn poll_imported_copy(&mut self) {
+        let Some(receiver) = &self.imported_copy else {
+            return;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err("Copy task disconnected".to_string()),
+        };
+        self.import_status = match result {
+            Ok(path) => format!("{}: {}", self.language.pick("副本已保存", "Copy saved"), path.display()),
+            Err(error) => format!(
+                "{}: {error}",
+                self.language.pick(
+                    "副本保存失败，请选择新文件名重试",
+                    "Copy failed; retry with a new filename"
+                )
+            ),
+        };
+        self.imported_copy = None;
+    }
+
+    fn return_to_live(&mut self) {
+        if self.plot_source == PlotSource::Imported {
+            self.close_imported_recording();
+        } else {
+            self.plot_source = PlotSource::Live;
+            self.cursor_readout = None;
+            self.cursor_pinned = false;
+            self.chart_viewport.selection = None;
+            self.chart_follow_mode = self.preferred_follow_mode();
+            self.reset_plots_requested = true;
+        }
+    }
+
     fn export_buffer(&mut self) {
         let Some(state) = &self.device_state else {
             self.recording_status = "请先连接 KM003C，再导出数据".to_string();
@@ -4066,6 +4168,7 @@ impl PowerMonitorApp {
                 let path = recording.path.clone();
                 self.imported_recording = Some(recording);
                 self.plot_source = PlotSource::Imported;
+                self.record_manager = None;
                 self.active_tab = WorkspaceTab::Monitor;
                 self.time_window = TimeWindow::All;
                 self.chart_viewport.selection = None;
@@ -4144,7 +4247,7 @@ impl PowerMonitorApp {
     fn source_label(&self) -> String {
         let language = self.language;
         match self.plot_source {
-            PlotSource::Live => language.pick("实时 AdcQueue", "Live AdcQueue").to_string(),
+            PlotSource::Live => language.pick("实时采样", "Live measurements").to_string(),
             PlotSource::Offline => self.offline_view.as_ref().map_or_else(
                 || language.pick("设备离线记录", "On-device recording").to_string(),
                 |view| {
@@ -4550,6 +4653,7 @@ impl PowerMonitorApp {
         if escape {
             if !ctx.egui_wants_keyboard_input() {
                 self.settings_open = false;
+                self.record_manager = None;
                 self.advanced_analysis_open = false;
                 self.disconnect_confirmation = false;
                 self.clear_data_confirmation = false;
@@ -4626,6 +4730,7 @@ impl PowerMonitorApp {
             WorkspaceTab::PdAnalysis => self.show_pd_analysis_page(ui),
         }
         self.show_settings_window(ui.ctx());
+        self.show_record_manager(ui.ctx());
         self.show_advanced_analysis_window(ui.ctx());
         self.show_disconnect_confirmation(ui.ctx());
         self.show_clear_data_confirmation(ui.ctx());
@@ -4860,47 +4965,6 @@ impl PowerMonitorApp {
                                     );
                                 });
                             });
-
-                        // Keep a quick skin switch in the global header so a
-                        // wallpaper can be dismissed without opening Settings.
-                        // The compact label and fixed width keep the language
-                        // and connection controls from shifting when locales
-                        // change.
-                        let current_skin = self.skin;
-                        let mut requested_skin = None;
-                        let skin_menu = egui::ComboBox::from_id_salt("workspace_skin")
-                            .width(if compact { 88.0 } else { 112.0 })
-                            .selected_text(current_skin.localized_short_label(language))
-                            .show_ui(ui, |ui| {
-                                ui.set_min_width(156.0);
-                                for option in SkinId::ALL {
-                                    if ui
-                                        .selectable_label(current_skin == option, option.localized_label(language))
-                                        .clicked()
-                                    {
-                                        requested_skin = Some(option);
-                                    }
-                                }
-                            });
-                        if let Some(skin) = requested_skin {
-                            self.set_skin(ui.ctx(), skin);
-                        }
-                        skin_menu.response.on_hover_text(language.pick(
-                            "快速切换皮肤；日系风格会显示壁纸",
-                            "Quickly switch skins; Japanese style shows the wallpaper",
-                        ));
-
-                        egui::ComboBox::from_id_salt("workspace_language")
-                            .width(72.0)
-                            .selected_text(self.language.short_name())
-                            .show_ui(ui, |ui| {
-                                ui.set_min_width(132.0);
-                                for option in Language::ALL {
-                                    ui.selectable_value(&mut self.language, option, option.native_name());
-                                }
-                            })
-                            .response
-                            .on_hover_text(language.pick("切换界面语言", "Change interface language"));
                     });
                 });
             });
@@ -4923,7 +4987,7 @@ impl PowerMonitorApp {
             )
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
-                ui.spacing_mut().interact_size.y = 30.0;
+                ui.spacing_mut().interact_size.y = 32.0;
                 ui.horizontal(|ui| {
                     let record_label = match self.recording_phase {
                         RecordingPhase::Recording => language.pick("Ⅱ 暂停记录", "Ⅱ Pause"),
@@ -4969,7 +5033,7 @@ impl PowerMonitorApp {
                                         ToolbarDensity::Compact => 104.0,
                                         ToolbarDensity::Narrow => 96.0,
                                     },
-                                    30.0,
+                                    32.0,
                                 )),
                         )
                         .clicked()
@@ -4994,7 +5058,7 @@ impl PowerMonitorApp {
                             } else {
                                 language.pick("保存录制", "Save recording")
                             })
-                                .min_size(egui::vec2(if compact { 60.0 } else { 88.0 }, 30.0)),
+                                .min_size(egui::vec2(if compact { 60.0 } else { 88.0 }, 32.0)),
                         )
                         .clicked()
                     {
@@ -5010,7 +5074,7 @@ impl PowerMonitorApp {
                             theme::text_secondary()
                         };
                         ui.allocate_ui_with_layout(
-                            egui::vec2(if compact { 100.0 } else { 118.0 }, 30.0),
+                            egui::vec2(if compact { 100.0 } else { 118.0 }, 32.0),
                             egui::Layout::left_to_right(egui::Align::Center),
                             |ui| {
                                 ui.colored_label(
@@ -5088,7 +5152,7 @@ impl PowerMonitorApp {
                                 ToolbarDensity::Compact => 104.0,
                                 ToolbarDensity::Narrow => 72.0,
                             },
-                            30.0,
+                            32.0,
                         ),
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
@@ -5101,60 +5165,42 @@ impl PowerMonitorApp {
                     );
 
                     ui.add(egui::Separator::default().vertical().spacing(6.0));
-                    if ui
+                    if !narrow && ui
                         .add(
                             egui::Button::new(if compact {
                                 language.pick("导入", "Import")
                             } else {
                                 language.pick("↓ 导入", "↓ Import")
                             })
-                            .min_size(egui::vec2(68.0, 30.0)),
+                            .min_size(egui::vec2(68.0, 32.0)),
                         )
                         .clicked()
                     {
                         self.import_recording_dialog();
                     }
 
-                    let can_export = self.plot_source == PlotSource::Live
-                        && !self.data_points.is_empty()
-                        && self.recorder.is_none();
-                    if density == ToolbarDensity::Full
+                    let can_export = self.can_export_current_source();
+                    if !narrow
                         && ui
                             .add_enabled(
                                 can_export,
                                 egui::Button::new(language.pick("导出", "Export"))
-                                    .min_size(egui::vec2(68.0, 30.0)),
+                                    .min_size(egui::vec2(68.0, 32.0)),
                             )
                             .on_hover_text(language.pick(
-                                "按设置中的格式导出当前实时缓冲区（CSV 或 Parquet）",
-                                "Export the current live buffer in the selected format (CSV or Parquet)",
+                                "导出当前查看的数据；导入文件另存为原格式副本。",
+                                "Export the displayed data; imported files are copied in their original format.",
                             ))
                             .clicked()
                     {
-                        self.export_buffer();
-                    }
-
-                    if density == ToolbarDensity::Full
-                        && ui
-                            .add_enabled(
-                                self.can_clear_live_data(),
-                                egui::Button::new(language.pick("清空数据", "Clear data"))
-                                    .min_size(egui::vec2(82.0, 30.0)),
-                            )
-                            .on_hover_text(language.pick(
-                                "清空当前实时缓冲区；录制期间请先保存当前会话",
-                                "Clear the live buffer. Save the current session before clearing while recording.",
-                            ))
-                            .clicked()
-                    {
-                        self.clear_data_confirmation = true;
+                        self.export_current_source();
                     }
 
                     if density != ToolbarDensity::Narrow
                         && ui
                             .add(
                                 egui::Button::new(language.pick("恢复视图", "Reset view"))
-                                    .min_size(egui::vec2(if compact { 76.0 } else { 88.0 }, 30.0)),
+                                    .min_size(egui::vec2(if compact { 76.0 } else { 88.0 }, 32.0)),
                             )
                             .clicked()
                     {
@@ -5166,21 +5212,20 @@ impl PowerMonitorApp {
 
                     if ui
                         .add(egui::Button::new(language.pick("离线导入", "On-device import"))
-                            .min_size(egui::vec2(if compact { 76.0 } else { 112.0 }, 30.0)))
+                            .min_size(egui::vec2(if compact { 76.0 } else { 112.0 }, 32.0)))
                         .on_hover_text(language.pick(
                             "从 KM003C 下载已保存的离线记录；请先在设备上选择记录。",
                             "Download a saved log from KM003C. Select the recording on the device first.",
                         ))
                         .clicked()
                     {
-                        self.settings_page = SettingsPage::DataAndDevice;
-                        self.settings_open = true;
+                        self.record_manager = Some(RecordManagerPage::OnDevice);
                         self.request_offline_catalog();
                     }
 
                     {
                         ui.allocate_ui_with_layout(
-                            egui::vec2(if narrow { 64.0 } else { 72.0 }, 30.0),
+                            egui::vec2(if narrow { 64.0 } else { 72.0 }, 32.0),
                             egui::Layout::left_to_right(egui::Align::Center),
                             |ui| {
                                 ui.menu_button(language.pick("更多", "More"), |ui| {
@@ -5194,20 +5239,24 @@ impl PowerMonitorApp {
                                         self.request_new_measurement();
                                         ui.close();
                                     }
+                                    if narrow && ui.button(language.pick("导入文件…", "Import file…")).clicked() {
+                                        self.import_recording_dialog();
+                                        ui.close();
+                                    }
                                     if ui
                                         .add_enabled(
                                             can_export,
-                                            egui::Button::new(language.pick("导出缓冲区", "Export buffer")),
+                                            egui::Button::new(language.pick("导出当前数据", "Export current data")),
                                         )
                                         .clicked()
                                     {
-                                        self.export_buffer();
+                                        self.export_current_source();
                                         ui.close();
                                     }
                                     if ui
                                         .add_enabled(
                                             self.can_clear_live_data(),
-                                            egui::Button::new(language.pick("清空实时数据…", "Clear live data…")),
+                                            egui::Button::new(language.pick("清空实时视图…", "Clear live view…")),
                                         )
                                         .on_hover_text(language.pick(
                                             "录制期间请先继续或保存当前会话",
@@ -5229,13 +5278,11 @@ impl PowerMonitorApp {
                                     }
                                     ui.separator();
                                     if ui.button(language.pick("可恢复录制…", "Recoverable recordings…")).clicked() {
-                                        self.settings_page = SettingsPage::Recording;
-                                        self.settings_open = true;
+                                        self.record_manager = Some(RecordManagerPage::Recovery);
                                         ui.close();
                                     }
                                     if ui.button(language.pick("高级曲线…", "Advanced traces…")).clicked() {
-                                        self.settings_page = SettingsPage::Chart;
-                                        self.settings_open = true;
+                                        self.advanced_analysis_open = true;
                                         ui.close();
                                     }
                                     if ui.button(language.pick("自动暂停设置…", "Auto-pause settings…")).clicked() {
@@ -5251,45 +5298,97 @@ impl PowerMonitorApp {
             });
     }
 
+    /// Integrity must belong to the plotted source, never to a parallel USB stream.
+    fn source_quality_counts(&self) -> Option<(u64, u64)> {
+        match self.plot_source {
+            PlotSource::Live if self.total_samples > 0 => Some((self.dropped_samples, self.discarded_sequence_samples)),
+            PlotSource::Imported => self
+                .imported_recording
+                .as_ref()
+                .and_then(|recording| recording.metadata.as_ref())
+                .map(|metadata| (metadata.missing_samples, metadata.discarded_sequence_samples)),
+            _ => None,
+        }
+    }
+
+    fn source_rate_label(&self) -> String {
+        match self.plot_source {
+            PlotSource::Live => self.current_rate.label().to_string(),
+            PlotSource::Offline => self.offline_view.as_ref().map_or_else(
+                || "— SPS".to_string(),
+                |view| {
+                    let interval = view.log.metadata.interval.get::<km003c_lib::uom::si::time::second>();
+                    if interval > 0.0 {
+                        format!("{:.2} SPS", 1.0 / interval)
+                    } else {
+                        "— SPS".to_string()
+                    }
+                },
+            ),
+            PlotSource::Imported => self
+                .imported_recording
+                .as_ref()
+                .and_then(|recording| recording.samples.first())
+                .map_or_else(
+                    || "— SPS".to_string(),
+                    |sample| {
+                        if sample.sample_rate_hz > 0 {
+                            format!("{} SPS", sample.sample_rate_hz)
+                        } else {
+                            "— SPS".to_string()
+                        }
+                    },
+                ),
+        }
+    }
+
     fn show_status_bar(&mut self, ui: &mut egui::Ui) {
         let language = self.language;
+        let status = match self.plot_source {
+            PlotSource::Live => i18n::connection_guidance(language, self.phase, self.last_connection_error.as_deref())
+                .unwrap_or_default(),
+            PlotSource::Offline => self.offline_status.clone(),
+            PlotSource::Imported => self.import_status.clone(),
+        };
+        let (color, quality) = match self.source_quality_counts() {
+            Some((0, 0)) => (theme::CURRENT, language.pick("数据完整", "Data complete").to_string()),
+            Some((missing, discarded)) => (
+                theme::POWER,
+                format!(
+                    "{} {missing} · {} {discarded}",
+                    language.pick("缺失", "Missing"),
+                    language.pick("丢弃", "Discarded")
+                ),
+            ),
+            None => (
+                theme::muted_text(),
+                language.pick("完整度未知", "Integrity unknown").to_string(),
+            ),
+        };
         egui::Panel::bottom("workbench_status_bar")
             .exact_size(24.0)
             .frame(
                 egui::Frame::NONE
                     .fill(theme::backplane())
-                    .stroke(egui::Stroke::new(1.0, theme::divider()))
                     .inner_margin(egui::Margin::symmetric(10, 2)),
             )
             .show(ui, |ui| {
                 ui.columns(3, |columns| {
-                    columns[0].horizontal(|ui| {
-                        if let Some(guidance) =
-                            i18n::connection_guidance(self.language, self.phase, self.last_connection_error.as_deref())
-                        {
-                            ui.label(egui::RichText::new(&guidance).small().color(theme::RECORDING))
-                                .on_hover_text(guidance);
-                        }
-                    });
+                    columns[0]
+                        .add(
+                            egui::Label::new(egui::RichText::new(&status).small().color(theme::text_secondary()))
+                                .truncate(),
+                        )
+                        .on_hover_text(&status);
                     columns[1].with_layout(
                         egui::Layout::left_to_right(egui::Align::Center).with_main_justify(true),
                         |ui| {
-                            let rate_label = if self.streaming && self.current_rate != self.selected_rate {
-                                format!("{} · {}", self.current_rate.label(), language.pick("实际", "actual"))
-                            } else {
-                                self.current_rate.label().to_string()
-                            };
                             ui.add(
                                 egui::Label::new(
                                     egui::RichText::new(format!(
                                         "{} · {} pts",
-                                        rate_label,
-                                        match self.plot_source {
-                                            PlotSource::Live => self.total_samples,
-                                            PlotSource::Offline | PlotSource::Imported => {
-                                                self.source_sample_count() as u64
-                                            }
-                                        }
+                                        self.source_rate_label(),
+                                        self.source_sample_count()
                                     ))
                                     .monospace(),
                                 )
@@ -5299,22 +5398,7 @@ impl PowerMonitorApp {
                         },
                     );
                     columns[2].with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let data_complete = self.dropped_samples == 0 && self.discarded_sequence_samples == 0;
-                        let (color, label) = if data_complete {
-                            (theme::CURRENT, language.pick("数据完整", "Data complete").to_string())
-                        } else {
-                            (
-                                theme::POWER,
-                                format!(
-                                    "{} {} · {} {}",
-                                    language.pick("缺失", "Missing"),
-                                    self.dropped_samples,
-                                    language.pick("丢弃", "Discarded"),
-                                    self.discarded_sequence_samples,
-                                ),
-                            )
-                        };
-                        ui.colored_label(color, format!("● {label}"));
+                        ui.add(egui::Label::new(egui::RichText::new(format!("● {quality}")).color(color)).truncate());
                         if self.demo_mode {
                             ui.colored_label(theme::POWER, "DEMO");
                         }
@@ -5593,6 +5677,7 @@ impl PowerMonitorApp {
     }
 
     fn show_instrument_rail(&mut self, ui: &mut egui::Ui, compact: bool) {
+        ui.spacing_mut().item_spacing.y = if compact { 2.0 } else { 4.0 };
         let language = self.language;
         let current = self.displayed_current_readout();
         let readout_available = self.instrument_readout_available();
@@ -5611,7 +5696,7 @@ impl PowerMonitorApp {
                 readout_status,
             },
         );
-        ui.add_space(if compact { 8.0 } else { 12.0 });
+        ui.add_space(if compact { 4.0 } else { 12.0 });
         instrument_card(
             ui,
             InstrumentCardData {
@@ -5625,7 +5710,7 @@ impl PowerMonitorApp {
                 readout_status,
             },
         );
-        ui.add_space(if compact { 8.0 } else { 12.0 });
+        ui.add_space(if compact { 4.0 } else { 12.0 });
         instrument_card(
             ui,
             InstrumentCardData {
@@ -5640,7 +5725,7 @@ impl PowerMonitorApp {
             },
         );
 
-        ui.add_space(if compact { 8.0 } else { 12.0 });
+        ui.add_space(if compact { 4.0 } else { 12.0 });
         let accumulated = if self.plot_source == PlotSource::Live {
             AccumulatedReadout {
                 cumulative_energy_uwh: self.displayed_cumulative_energy_uwh(),
@@ -5729,7 +5814,7 @@ impl PowerMonitorApp {
                     });
             });
 
-        ui.add_space(if compact { 8.0 } else { 12.0 });
+        ui.add_space(if compact { 4.0 } else { 12.0 });
         let [dp, dm, cc1, cc2] = self.source_signal_values();
         let protocol_state = self.displayed_protocol_state();
         let protocol_summary = match protocol_state {
@@ -5836,7 +5921,7 @@ impl PowerMonitorApp {
             self.active_tab = WorkspaceTab::PdAnalysis;
         }
 
-        ui.add_space(if compact { 8.0 } else { 12.0 });
+        ui.add_space(if compact { 4.0 } else { 12.0 });
         let signal_width = ui.available_width();
         egui::Frame::NONE
             .fill(theme::panel())
@@ -5876,84 +5961,49 @@ impl PowerMonitorApp {
     }
 }
 
-/// Quiet settings surface. Navigation decides which small set of sections is
-/// visible, so the content itself no longer needs nested accordion chrome.
-fn settings_section(ui: &mut egui::Ui, title: &str, _default_open: bool, add_contents: impl FnOnce(&mut egui::Ui)) {
+/// Settings use one bounded surface; form rows own their actual content height.
+fn settings_section(ui: &mut egui::Ui, title: &str, default_open: bool, add_contents: impl FnOnce(&mut egui::Ui)) {
     let frame_width = ui.available_width();
     egui::Frame::NONE
         .fill(theme::panel_raised())
-        .stroke(egui::Stroke::new(1.0, theme::divider().gamma_multiply(0.75)))
         .corner_radius(egui::CornerRadius::same(6))
         .inner_margin(egui::Margin::symmetric(12, 10))
         .show(ui, |ui| {
-            let content_width = (frame_width - 24.0).max(120.0);
-            ui.set_min_width(content_width);
+            let content_width = (frame_width - 24.0).max(0.0);
             ui.set_width(content_width);
             ui.set_max_width(content_width);
-            ui.label(
-                egui::RichText::new(title)
-                    .strong()
-                    .size(14.0)
-                    .color(theme::text_primary()),
-            );
-            ui.add_space(7.0);
-            add_contents(ui);
+            if default_open {
+                ui.label(
+                    egui::RichText::new(title)
+                        .strong()
+                        .size(14.0)
+                        .color(theme::text_primary()),
+                );
+                ui.add_space(8.0);
+                add_contents(ui);
+            } else {
+                egui::CollapsingHeader::new(egui::RichText::new(title).strong())
+                    .default_open(false)
+                    .show(ui, add_contents);
+            }
         });
-    ui.add_space(8.0);
+    ui.add_space(12.0);
 }
 
-/// A compact DSH-inspired choice card for mutually exclusive settings.  The
-/// card keeps title and explanation on stable rows, so switching languages or
-/// changing the selected option never moves the surrounding form columns.
-const SETTINGS_CHOICE_CARD_HEIGHT: f32 = 64.0;
-
-fn settings_choice_card(ui: &mut egui::Ui, width: f32, selected: bool, title: &str, description: &str) -> bool {
-    let inner_width = (width - 18.0).max(80.0);
-    let response = egui::Frame::NONE
-        .fill(if selected { theme::panel() } else { theme::backplane() })
-        .stroke(egui::Stroke::new(
-            if selected { 1.5 } else { 1.0 },
-            if selected { theme::accent() } else { theme::divider() },
-        ))
-        .corner_radius(egui::CornerRadius::same(6))
-        .inner_margin(egui::Margin::symmetric(9, 8))
-        .show(ui, |card| {
-            // Set all three width constraints so the frame cannot grow with
-            // translated text or a longer explanation.  The fixed height
-            // leaves room for a title plus two wrapped description lines.
-            card.set_min_width(inner_width);
-            card.set_width(inner_width);
-            card.set_max_width(inner_width);
-            card.set_min_height(SETTINGS_CHOICE_CARD_HEIGHT - 16.0);
-            card.set_height(SETTINGS_CHOICE_CARD_HEIGHT - 16.0);
-            card.set_max_height(SETTINGS_CHOICE_CARD_HEIGHT - 16.0);
-            card.allocate_ui_with_layout(
-                egui::vec2(inner_width, SETTINGS_CHOICE_CARD_HEIGHT - 16.0),
-                egui::Layout::top_down(egui::Align::Min),
-                |body| {
-                    body.set_width(inner_width);
-                    body.set_max_width(inner_width);
-                    body.label(egui::RichText::new(title).strong().color(if selected {
-                        theme::text_primary()
-                    } else {
-                        theme::text_secondary()
-                    }));
-                    body.add_sized(
-                        [inner_width, 32.0],
-                        egui::Label::new(egui::RichText::new(description).small().color(theme::muted_text())).wrap(),
-                    )
-                    .on_hover_text(description);
-                },
-            );
-        })
-        .response
-        .interact(egui::Sense::click());
-    response.clicked()
-}
-
-const SETTINGS_FORM_LABEL_WIDTH: f32 = 168.0;
+const SETTINGS_FORM_LABEL_WIDTH: f32 = 144.0;
 const SETTINGS_FORM_COLUMN_GAP: f32 = 12.0;
 const SETTINGS_FORM_ROW_HEIGHT: f32 = 38.0;
+
+/// Bound long labels to two rows without letting them resize their parent.
+/// The complete text is always available on hover.
+fn settings_text(ui: &mut egui::Ui, text: &str, width: f32, color: egui::Color32) -> egui::Response {
+    let mut job =
+        egui::text::LayoutJob::simple(text.to_owned(), egui::FontId::proportional(13.0), color, width.max(1.0));
+    job.wrap.max_rows = 2;
+    job.wrap.break_anywhere = true;
+    ui.add(egui::Label::new(job).halign(egui::Align::Min))
+        .on_hover_text(text)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct SettingsFormMetrics {
@@ -5965,27 +6015,11 @@ struct SettingsFormMetrics {
 impl SettingsFormMetrics {
     fn for_available_width(available_width: f32) -> Self {
         Self {
-            label_width: SETTINGS_FORM_LABEL_WIDTH,
+            label_width: SETTINGS_FORM_LABEL_WIDTH.min((available_width - SETTINGS_FORM_COLUMN_GAP).max(0.0)),
             control_width: settings_control_width(available_width),
             column_gap: SETTINGS_FORM_COLUMN_GAP,
         }
     }
-}
-
-fn settings_form_label_with_width(ui: &mut egui::Ui, width: f32, label: &str, min_height: f32) {
-    ui.allocate_ui_with_layout(
-        egui::vec2(width, min_height),
-        egui::Layout::left_to_right(egui::Align::Center),
-        |ui| {
-            ui.set_width(width);
-            ui.set_max_width(width);
-            ui.add_sized(
-                [width, min_height],
-                egui::Label::new(egui::RichText::new(label).color(theme::muted_text())).wrap(),
-            )
-            .on_hover_text(label);
-        },
-    );
 }
 
 fn settings_form_row(
@@ -5995,33 +6029,50 @@ fn settings_form_row(
     min_height: f32,
     add_control: impl FnOnce(&mut egui::Ui),
 ) {
-    settings_form_label_with_width(ui, metrics.label_width, label, min_height);
-    ui.allocate_ui_with_layout(
-        egui::vec2(metrics.control_width, min_height),
-        egui::Layout::top_down(egui::Align::Min),
-        |control| {
-            control.set_width(metrics.control_width);
-            control.set_max_width(metrics.control_width);
-            add_control(control);
-        },
+    let origin = ui.next_widget_position();
+    let width = metrics.label_width + metrics.column_gap + metrics.control_width;
+    let control_origin = origin + egui::vec2(metrics.label_width + metrics.column_gap, 0.0);
+    let mut control = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt(("form_control", label))
+            .max_rect(egui::Rect::from_min_size(
+                control_origin,
+                egui::vec2(metrics.control_width, min_height),
+            ))
+            .layout(egui::Layout::top_down(egui::Align::Min)),
     );
+    control.set_width(metrics.control_width);
+    control.set_max_width(metrics.control_width);
+    control.spacing_mut().interact_size.y = 32.0;
+    // Give simple controls a 3px inset; multi-line controls determine row height.
+    control.add_space(3.0);
+    add_control(&mut control);
+    let height = min_height.max(control.min_rect().bottom() - origin.y + 3.0);
+    let label_rect = egui::Rect::from_min_size(origin, egui::vec2(metrics.label_width, height));
+    let mut label_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(label_rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    settings_text(&mut label_ui, label, metrics.label_width, theme::muted_text());
+    ui.advance_cursor_after_rect(egui::Rect::from_min_size(origin, egui::vec2(width, height)));
     ui.end_row();
 }
 
 fn settings_control_width(available_width: f32) -> f32 {
-    (available_width - SETTINGS_FORM_LABEL_WIDTH - SETTINGS_FORM_COLUMN_GAP).max(180.0)
+    (available_width - SETTINGS_FORM_LABEL_WIDTH - SETTINGS_FORM_COLUMN_GAP).max(0.0)
 }
 
 fn settings_equal_column_width(available_width: f32, columns: usize, gap: f32) -> f32 {
     if columns == 0 {
         return 0.0;
     }
-    ((available_width - gap * columns.saturating_sub(1) as f32) / columns as f32).max(96.0)
+    ((available_width - gap * columns.saturating_sub(1) as f32) / columns as f32).max(0.0)
 }
 
 fn settings_segment(ui: &mut egui::Ui, selected: bool, width: f32, label: &str) -> bool {
     ui.add_sized(
-        [width, 30.0],
+        [width, 32.0],
         egui::Button::new(egui::RichText::new(label).strong().color(if selected {
             theme::text_primary()
         } else {
@@ -6036,7 +6087,7 @@ fn settings_segment(ui: &mut egui::Ui, selected: bool, width: f32, label: &str) 
         .stroke(egui::Stroke::new(
             1.0,
             if selected {
-                theme::divider()
+                theme::accent()
             } else {
                 egui::Color32::TRANSPARENT
             },
@@ -6127,11 +6178,11 @@ fn instrument_card(ui: &mut egui::Ui, data: InstrumentCardData<'_>) {
         .corner_radius(egui::CornerRadius::same(6))
         .inner_margin(egui::Margin::symmetric(
             if compact { 12 } else { 16 },
-            if compact { 7 } else { 10 },
+            if compact { 4 } else { 10 },
         ))
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
-            ui.set_min_width((card_width - if compact { 24.0 } else { 32.0 }).max(120.0));
+            ui.set_width((card_width - if compact { 26.0 } else { 34.0 }).max(120.0));
             ui.set_min_height(if compact { 78.0 } else { 96.0 });
             ui.horizontal(|ui| {
                 let status_width = 58.0;
@@ -6169,7 +6220,7 @@ fn instrument_card(ui: &mut egui::Ui, data: InstrumentCardData<'_>) {
                 let value_width = (ui.available_width() - unit_width - 4.0).max(48.0);
                 ui.allocate_ui_with_layout(
                     egui::vec2(value_width, if compact { 29.0 } else { 36.0 }),
-                    egui::Layout::left_to_right(egui::Align::Center),
+                    egui::Layout::right_to_left(egui::Align::Center),
                     |ui| {
                         ui.label(
                             egui::RichText::new(
@@ -6325,74 +6376,65 @@ fn compact_signal_value(ui: &mut egui::Ui, label: &str, value: Option<f64>, widt
 }
 
 impl PowerMonitorApp {
-    fn show_imported_recording_banner(&mut self, ui: &mut egui::Ui, compact: bool) {
-        if self.plot_source != PlotSource::Imported {
+    fn show_imported_recording_banner(&mut self, ui: &mut egui::Ui, _compact: bool) {
+        if self.plot_source == PlotSource::Live {
             return;
         }
         let language = self.language;
-        let Some(recording) = &self.imported_recording else {
-            return;
-        };
-        let file_name = recording
-            .path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("KM003C recording")
-            .to_string();
-        let metadata = recording.metadata.clone();
-        let points = recording.samples.len();
-        let mut close_requested = false;
+        let title = format!("{} · {} pts", self.source_label(), self.source_sample_count());
+        let detail = self
+            .imported_recording
+            .as_ref()
+            .filter(|_| self.plot_source == PlotSource::Imported)
+            .and_then(|recording| recording.metadata.as_ref())
+            .map(|metadata| {
+                format!(
+                    "{} → {} · {} · {:.3}%",
+                    metadata.timestamps.started_at_beijing,
+                    metadata
+                        .timestamps
+                        .ended_at_beijing
+                        .as_deref()
+                        .unwrap_or(language.pick("结束时间未知", "End time unknown")),
+                    format_recording_duration(Duration::from_micros(metadata.effective_duration_us)),
+                    metadata.completeness_percent
+                )
+            })
+            .unwrap_or_else(|| {
+                language
+                    .pick(
+                        "记录时间或完整度元数据未知",
+                        "Recording time or integrity metadata unknown",
+                    )
+                    .to_string()
+            });
+        let width = ui.available_width();
+        let mut close = false;
         egui::Frame::NONE
             .fill(theme::panel_raised())
-            .stroke(egui::Stroke::new(1.0, theme::divider()))
-            .corner_radius(egui::CornerRadius::same(6))
-            .inner_margin(egui::Margin::symmetric(10, 6))
+            .corner_radius(6)
+            .inner_margin(egui::Margin::symmetric(10, 4))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(file_name).strong().color(theme::text_primary()));
-                    if !compact {
-                        if let Some(metadata) = &metadata {
-                            ui.separator();
-                            ui.monospace(&metadata.timestamps.started_at_beijing);
-                            ui.label("→");
-                            ui.monospace(
-                                metadata
-                                    .timestamps
-                                    .ended_at_beijing
-                                    .as_deref()
-                                    .unwrap_or(language.pick("结束时间未知", "End time unknown")),
-                            );
-                            ui.separator();
-                            ui.monospace(format!(
-                                "{} · {points} pts · {:.3}%",
-                                format_recording_duration(Duration::from_micros(metadata.effective_duration_us)),
-                                metadata.completeness_percent,
-                            ));
-                        } else {
-                            ui.label(
-                                egui::RichText::new(language.pick(
-                                    "记录时间未知 · 旧文件没有会话元数据",
-                                    "Recording time unknown · This legacy file has no session metadata",
-                                ))
-                                .small()
-                                .color(theme::muted_text()),
-                            );
-                        }
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        close_requested = ui
-                            .button(if compact {
-                                language.pick("关闭", "Close")
-                            } else {
-                                language.pick("关闭导入文件", "Close imported file")
-                            })
-                            .clicked();
-                    });
+                    let label_width = (width - 20.0 - 128.0 - 8.0).max(0.0);
+                    ui.add_sized(
+                        [label_width, 32.0],
+                        egui::Label::new(egui::RichText::new(&title).strong())
+                            .halign(egui::Align::Min)
+                            .truncate(),
+                    )
+                    .on_hover_text(format!("{title}\n{detail}"));
+                    close = ui
+                        .add_sized(
+                            [128.0, 32.0],
+                            egui::Button::new(language.pick("返回实时", "Return to live")),
+                        )
+                        .clicked();
                 });
             });
-        ui.add_space(6.0);
-        if close_requested {
-            self.close_imported_recording();
+        ui.add_space(4.0);
+        if close {
+            self.return_to_live();
         }
     }
 
@@ -6400,14 +6442,7 @@ impl PowerMonitorApp {
         let language = self.language;
         let selection = self.ensure_chart_selection();
         let navigator_height = if compact { 62.0 } else { 76.0 };
-        let metadata_banner_height = if self.plot_source == PlotSource::Imported {
-            44.0
-        } else {
-            0.0
-        };
-        let chart_height =
-            (ui.available_height() - navigator_height - metadata_banner_height - if compact { 208.0 } else { 220.0 })
-                .max(240.0);
+        let workspace_bottom = ui.max_rect().bottom();
         let max_plot_points = (ui.available_width().max(320.0) * 2.0) as usize;
         let vip_points = self.source_vip_points(selection, max_plot_points, self.display_filter);
         let accumulated_points = self.source_accumulated_points(selection, max_plot_points);
@@ -6442,9 +6477,6 @@ impl PowerMonitorApp {
         } else {
             0.0
         };
-        let main_plot_height =
-            (chart_height - cumulative_track_height - if cumulative_track_visible { 8.0 } else { 0.0 })
-                .max(if compact { 190.0 } else { 220.0 });
         let show_chart_art = self.skin_art_available() && ui.available_width() >= if compact { 760.0 } else { 820.0 };
 
         egui::Frame::NONE
@@ -6456,7 +6488,7 @@ impl PowerMonitorApp {
                 self.show_imported_recording_banner(ui, compact);
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new(language.pick("V / A / W 实时轨迹", "V / A / W live traces"))
+                        egui::RichText::new(language.pick("V / A / W 测量曲线", "V / A / W measurements"))
                             .strong()
                             .size(16.0),
                     );
@@ -6779,6 +6811,7 @@ impl PowerMonitorApp {
                             .label(egui::RichText::new(axis_label).color(color))
                             .placement(placement)
                             .tick_label_color(color)
+                            .label_spacing(16.0..=28.0)
                             .min_thickness(match (series_index, compact) {
                                 (0, true) => 42.0,
                                 (1, true) => 50.0,
@@ -6845,8 +6878,19 @@ impl PowerMonitorApp {
                 let active_pause = self.active_pause_started_at;
                 let active_pause_end = self.source_end_time();
                 let pinned_cursor = self.cursor_pinned.then_some(self.cursor_readout).flatten();
+                // Measure after the header, legends and cursor strip: their height changes
+                // with language, skin and available width. Reserve the navigator first.
+                let statistics_height = ui.text_style_height(&egui::TextStyle::Body) * 3.0 + 20.0;
+                let main_plot_height = (workspace_bottom
+                    - ui.cursor().top()
+                    - navigator_height
+                    - statistics_height
+                    - cumulative_track_height
+                    - 48.0)
+                    .max(80.0);
                 let plot_response = Plot::new("combined_monitor_plot")
                     .height(main_plot_height)
+                    .y_grid_spacer(|_| (0..=4).map(|index| GridMark { value: f64::from(index) / 4.0, step_size: 0.25 }).collect())
                     .link_axis("monitor_time_axis", [true, false])
                     .link_cursor("monitor_cursor", [true, false])
                     .custom_x_axes(vec![x_axis])
@@ -7063,6 +7107,7 @@ impl PowerMonitorApp {
                                 .label(egui::RichText::new(axis_label).color(color))
                                 .placement(placement)
                                 .tick_label_color(color)
+                                .label_spacing(16.0..=28.0)
                                 .min_thickness(if compact { 46.0 } else { 58.0 })
                                 .formatter(move |mark: GridMark, _| {
                                     if scale_mode == ChartScaleMode::Relative {
@@ -7080,6 +7125,7 @@ impl PowerMonitorApp {
                     let cumulative_cursor = self.cursor_pinned.then_some(self.cursor_readout).flatten();
                     let cumulative_plot_response = Plot::new("cumulative_monitor_plot")
                         .height(cumulative_track_height)
+                        .y_grid_spacer(|_| (0..=2).map(|index| GridMark { value: f64::from(index) / 2.0, step_size: 0.5 }).collect())
                         .link_axis("monitor_time_axis", [true, false])
                         .link_cursor("monitor_cursor", [true, false])
                         .custom_x_axes(vec![cumulative_x_axis])
@@ -7770,7 +7816,8 @@ impl PowerMonitorApp {
         let metrics = SettingsLayoutMetrics::for_content_rect(ctx.content_rect());
         let mut close_requested = false;
         egui::Window::new(self.language.pick("工作台设置", "Workbench Settings"))
-            .id(egui::Id::new("settings_window_fixed_columns_v2"))
+            .frame(egui::Frame::window(&ctx.style_of(egui::Theme::Dark)).fill(theme::panel().to_opaque()))
+            .id(egui::Id::new("settings_window_compact_v3"))
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .fixed_size(metrics.window_size)
             .resizable(false)
@@ -7865,7 +7912,9 @@ impl PowerMonitorApp {
                                     |scroll_host| {
                                         scroll_host.set_width(content_size.x);
                                         scroll_host.set_max_width(content_size.x);
-                                        let scroll_content_width = scroll_host.available_width();
+                                        let scroll_content_width = (scroll_host.available_width()
+                                            - scroll_host.spacing().scroll.allocated_width())
+                                        .max(0.0);
                                         egui::ScrollArea::vertical()
                                             .id_salt(("settings_content_scroll_v2", self.settings_page as u8))
                                             .max_height(scroll_height)
@@ -7919,194 +7968,50 @@ impl PowerMonitorApp {
         if self.settings_page == SettingsPage::General {
             settings_section(ui, language.pick("界面", "Interface"), true, |ui| {
                 let form = SettingsFormMetrics::for_available_width(ui.available_width());
-                egui::Grid::new("settings_interface_grid")
-                    .num_columns(2)
-                    .spacing([form.column_gap, 8.0])
-                    .show(ui, |ui| {
-                        settings_form_row(
-                            ui,
-                            form,
-                            language.pick("界面语言", "Language"),
-                            SETTINGS_FORM_ROW_HEIGHT,
-                            |control| {
-                                egui::ComboBox::from_id_salt("settings_language")
-                                    .width(form.control_width)
-                                    .selected_text(self.language.native_name())
-                                    .show_ui(control, |control| {
-                                        for option in Language::ALL {
-                                            control.selectable_value(&mut self.language, option, option.native_name());
-                                        }
-                                    });
-                            },
-                        );
-
-                        settings_form_row(
-                            ui,
-                            form,
-                            language.pick("皮肤", "Skin"),
-                            SETTINGS_CHOICE_CARD_HEIGHT,
-                            |control| {
-                                let card_gap = 8.0;
-                                let card_width = ((form.control_width - card_gap) / 2.0).max(80.0);
-                                control.horizontal(|cards| {
-                                    cards.spacing_mut().item_spacing.x = card_gap;
-                                    for skin in SkinId::ALL {
-                                        let selected = self.skin == skin;
-                                        if settings_choice_card(
-                                            cards,
-                                            card_width,
-                                            selected,
-                                            skin.localized_label(language),
-                                            skin.localized_description(language),
-                                        ) {
-                                            self.set_skin(cards.ctx(), skin);
-                                        }
+                ui.vertical(|ui| {
+                    settings_form_row(
+                        ui,
+                        form,
+                        language.pick("界面语言", "Language"),
+                        SETTINGS_FORM_ROW_HEIGHT,
+                        |control| {
+                            egui::ComboBox::from_id_salt("settings_language")
+                                .width(form.control_width)
+                                .selected_text(self.language.native_name())
+                                .show_ui(control, |control| {
+                                    for option in Language::ALL {
+                                        control.selectable_value(&mut self.language, option, option.native_name());
                                     }
                                 });
-                            },
-                        );
-                    });
-            });
-
-            settings_section(ui, language.pick("数据源", "Data source"), true, |ui| {
-                let previous_source = self.plot_source;
-                let form = SettingsFormMetrics::for_available_width(ui.available_width());
-                egui::Grid::new("settings_data_source_grid")
-                    .num_columns(2)
-                    .spacing([form.column_gap, 8.0])
-                    .show(ui, |ui| {
-                        settings_form_row(ui, form, language.pick("数据源", "Source"), 48.0, |control| {
-                            let segment_gap = 8.0;
-                            let segment_width = ((form.control_width - segment_gap * 2.0) / 3.0).max(80.0);
-                            control.horizontal(|segments| {
-                                segments.spacing_mut().item_spacing.x = segment_gap;
-                                if settings_segment(
-                                    segments,
-                                    self.plot_source == PlotSource::Live,
-                                    segment_width,
-                                    language.pick("实时", "Live"),
-                                ) {
-                                    self.plot_source = PlotSource::Live;
-                                }
-                                segments.add_enabled_ui(
-                                    self.device_state.is_some() || self.offline_view.is_some(),
-                                    |segments| {
-                                        if settings_segment(
-                                            segments,
-                                            self.plot_source == PlotSource::Offline,
-                                            segment_width,
-                                            language.pick("设备离线", "On-device"),
-                                        ) {
-                                            self.settings_page = SettingsPage::DataAndDevice;
-                                            if self.offline_view.is_some() {
-                                                self.plot_source = PlotSource::Offline;
-                                            } else {
-                                                self.request_offline_catalog();
-                                            }
-                                        }
-                                    },
-                                );
-                                segments.add_enabled_ui(self.imported_recording.is_some(), |segments| {
-                                    if settings_segment(
-                                        segments,
-                                        self.plot_source == PlotSource::Imported,
-                                        segment_width,
-                                        language.pick("桌面导入", "Imported file"),
-                                    ) {
-                                        self.plot_source = PlotSource::Imported;
-                                    }
-                                });
-                            });
-                            control.add(
-                                egui::Label::new(
-                                    egui::RichText::new(language.pick(
-                                        "导入和关闭文件请使用监控工具栏或导入文件顶部的信息条。",
-                                        "Import and close files from the Monitor toolbar or the imported-file banner.",
-                                    ))
-                                    .small()
-                                    .color(theme::muted_text()),
-                                )
-                                .wrap(),
-                            );
-                        });
-                    });
-                if previous_source != self.plot_source {
-                    self.cursor_readout = None;
-                    self.cursor_pinned = false;
-                    self.chart_viewport.selection = None;
-                    self.reset_plots_requested = true;
-                    if self.plot_source != PlotSource::Live {
-                        self.time_window = TimeWindow::All;
-                    }
-                    self.chart_follow_mode = self.preferred_follow_mode();
-                }
-            });
-
-            settings_section(ui, language.pick("设备信息", "Device information"), false, |ui| {
-                if let Some(state) = &self.device_state {
-                    let form = SettingsFormMetrics::for_available_width(ui.available_width());
-                    egui::Grid::new("settings_device_info")
-                        .num_columns(2)
-                        .spacing([form.column_gap, 6.0])
-                        .show(ui, |ui| {
-                            for (label, value) in [
-                                (language.pick("型号", "Model"), state.info.model.as_str()),
-                                (language.pick("固件", "Firmware"), state.info.fw_version.as_str()),
-                                (language.pick("硬件", "Hardware"), state.info.hw_version.as_str()),
-                                (language.pick("序列号", "Serial number"), state.info.serial_id.as_str()),
-                            ] {
-                                settings_form_row(ui, form, label, SETTINGS_FORM_ROW_HEIGHT, |control| {
-                                    control
-                                        .add_sized(
-                                            [form.control_width, SETTINGS_FORM_ROW_HEIGHT],
-                                            egui::Label::new(egui::RichText::new(value).monospace()).wrap(),
-                                        )
-                                        .on_hover_text(value);
-                                });
-                            }
-                        });
-                } else {
-                    ui.label(
-                        egui::RichText::new(language.pick("未连接 KM003C", "KM003C is not connected"))
-                            .color(theme::muted_text()),
+                        },
                     );
-                }
-                let form = SettingsFormMetrics::for_available_width(ui.available_width());
-                egui::Grid::new("settings_usb_reset_grid")
-                    .num_columns(2)
-                    .spacing([form.column_gap, 6.0])
-                    .show(ui, |ui| {
-                        settings_form_row(
-                            ui,
-                            form,
-                            language.pick("高级连接", "Advanced connection"),
-                            48.0,
-                            |control| {
-                                control.checkbox(
-                                    &mut self.usb_reset,
-                                    language.pick(
-                                        "连接时执行 USB reset",
-                                        "Run USB reset when connecting",
-                                    ),
-                                )
-                                .on_hover_text(language.pick(
-                                    "macOS 默认跳过 USB reset；只在设备异常且你明确需要时开启。",
-                                    "USB reset is skipped by default on macOS. Enable it only when the device is malfunctioning and a reset is required.",
-                                ));
-                                control.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(language.pick(
-                                            "仅在设备异常时启用。",
-                                            "Enable only when the device is malfunctioning.",
-                                        ))
-                                        .small()
-                                        .color(theme::muted_text()),
-                                    )
-                                    .wrap(),
-                                );
-                            },
-                        );
-                    });
+
+                    settings_form_row(
+                        ui,
+                        form,
+                        language.pick("皮肤", "Skin"),
+                        SETTINGS_FORM_ROW_HEIGHT,
+                        |control| {
+                            let card_gap = 8.0;
+                            let card_width = ((form.control_width - card_gap) / 2.0).max(80.0);
+                            control.horizontal(|cards| {
+                                cards.spacing_mut().item_spacing.x = card_gap;
+                                for skin in SkinId::ALL {
+                                    let selected = self.skin == skin;
+                                    if settings_segment(cards, selected, card_width, skin.localized_label(language)) {
+                                        self.set_skin(cards.ctx(), skin);
+                                    }
+                                }
+                            });
+                            settings_text(
+                                control,
+                                self.skin.localized_description(language),
+                                form.control_width,
+                                theme::muted_text(),
+                            );
+                        },
+                    );
+                });
             });
         }
 
@@ -8114,10 +8019,7 @@ impl PowerMonitorApp {
             settings_section(ui, language.pick("录制", "Recording"), true, |ui| {
                 let mut auto_rule_changed = false;
                 let form = SettingsFormMetrics::for_available_width(ui.available_width());
-                egui::Grid::new("settings_recording_grid")
-                    .num_columns(2)
-                    .spacing([form.column_gap, 8.0])
-                    .show(ui, |ui| {
+                ui.vertical(|ui| {
                         settings_form_row(
                             ui,
                             form,
@@ -8145,7 +8047,7 @@ impl PowerMonitorApp {
                             ui,
                             form,
                             language.pick("锁屏保护", "Lock-screen protection"),
-                            64.0,
+                            SETTINGS_FORM_ROW_HEIGHT,
                             |control| {
                                 control.add_enabled_ui(!self.recording_session, |control| {
                                     control
@@ -8194,6 +8096,7 @@ impl PowerMonitorApp {
                             },
                         );
 
+                        if self.auto_pause_enabled {
                         settings_form_row(
                             ui,
                             form,
@@ -8260,6 +8163,7 @@ impl PowerMonitorApp {
                                 });
                             },
                         );
+                        }
                     });
                 if self.recorder.is_some() || self.recording_session {
                     ui.label(
@@ -8275,69 +8179,555 @@ impl PowerMonitorApp {
                     self.auto_pause_below_since_us = None;
                     self.auto_resume_above_since_us = None;
                 }
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(language.pick(
-                            "低于阈值达到持续时间后自动暂停；只有自动暂停才会在超过回差阈值后自动继续。手动暂停必须手动继续。",
-                            "The session pauses after the value stays below the threshold. Only an automatic pause can resume after the hysteresis threshold is exceeded; a manual pause always requires manual resume.",
-                        ))
-                        .small()
-                        .color(theme::muted_text()),
-                    )
-                    .wrap(),
-                );
+                if self.auto_pause_enabled {
+                    ui.vertical(|ui| {
+                        settings_form_row(ui, form, "", SETTINGS_FORM_ROW_HEIGHT, |control| {
+                            settings_text(control, language.pick(
+                                "低于阈值持续指定时间后暂停；自动暂停可自动继续，手动暂停需手动继续。",
+                                "Pause after the value stays below the threshold. Auto-paused sessions resume automatically; manual pauses require manual resume."
+                            ), form.control_width, theme::muted_text());
+                        });
+                    });
+                }
+            });
+        }
+
+        if self.settings_page == SettingsPage::Chart {
+            settings_section(ui, language.pick("图表", "Chart"), true, |ui| {
+                let previous_window = self.time_window;
+                let form = SettingsFormMetrics::for_available_width(ui.available_width());
+                ui.vertical(|ui| {
+                        settings_form_row(
+                            ui,
+                            form,
+                            language.pick("默认时间窗", "Default time window"),
+                            SETTINGS_FORM_ROW_HEIGHT,
+                            |control| {
+                                egui::ComboBox::from_id_salt("settings_time_window")
+                                    .width(form.control_width)
+                                    .selected_text(self.time_window.localized_label(language))
+                                    .show_ui(control, |control| {
+                                        for window in TimeWindow::all() {
+                                            control.selectable_value(
+                                                &mut self.time_window,
+                                                *window,
+                                                window.localized_label(language),
+                                            );
+                                        }
+                                    });
+                            },
+                        );
+
+                        settings_form_row(
+                            ui,
+                            form,
+                            language.pick("坐标显示", "Axis display"),
+                            SETTINGS_FORM_ROW_HEIGHT,
+                            |control| {
+                                let card_gap = 8.0;
+                                let card_width = settings_equal_column_width(form.control_width, 2, card_gap);
+                                control.horizontal(|cards| {
+                                    cards.spacing_mut().item_spacing.x = card_gap;
+                                    for mode in ChartScaleMode::ALL {
+                                        let selected = self.chart_scale_mode == mode;
+                                        if settings_segment(cards, selected, card_width, mode.localized_label(language)) {
+                                            self.chart_scale_mode = mode;
+                                        }
+                                    }
+                                });
+                                settings_text(control, self.chart_scale_mode.localized_description(language), form.control_width, theme::muted_text());
+                            },
+                        );
+
+                        settings_form_row(
+                            ui,
+                            form,
+                            language.pick("曲线降噪", "Trace smoothing"),
+                            SETTINGS_FORM_ROW_HEIGHT,
+                            |control| {
+                                let filter_response = egui::ComboBox::from_id_salt("settings_display_filter")
+                                    .width(form.control_width)
+                                    .selected_text(self.display_filter.localized_label(language))
+                                    .show_ui(control, |control| {
+                                        for filter in [DisplayFilter::Median5, DisplayFilter::Raw] {
+                                            control.selectable_value(
+                                                &mut self.display_filter,
+                                                filter,
+                                                filter.localized_label(language),
+                                            );
+                                        }
+                                    });
+                                filter_response.response.on_hover_text(language.pick(
+                                    "五点中值滤波只改变屏幕曲线；游标、统计、录制和导出始终使用原始采样。",
+                                    "The 5-point median filter affects only the displayed traces. Cursor values, statistics, recordings, and exports always use raw samples.",
+                                ));
+                            },
+                        );
+
+                        settings_form_row(
+                            ui,
+                            form,
+                            language.pick("累计曲线", "Cumulative traces"),
+                            SETTINGS_FORM_ROW_HEIGHT,
+                            |control| {
+                                control.horizontal(|control| {
+                                    control.spacing_mut().item_spacing.x = 16.0;
+                                    control.checkbox(
+                                        &mut self.visible_accumulated_series[0],
+                                        language.pick("累计能量", "Energy"),
+                                    );
+                                    control.checkbox(
+                                        &mut self.visible_accumulated_series[1],
+                                        language.pick("累计容量", "Capacity"),
+                                    );
+                                });
+                            },
+                        );
+
+                    });
+                if self.time_window != previous_window {
+                    self.chart_follow_mode = if self.time_window == TimeWindow::All {
+                        ChartFollowMode::FullSession
+                    } else {
+                        ChartFollowMode::LatestWindow
+                    };
+                    self.chart_viewport.selection = None;
+                }
+            });
+        }
+
+        if self.settings_page == SettingsPage::DataAndDevice {
+            settings_section(ui, language.pick("设备信息", "Device information"), true, |ui| {
+                if let Some(state) = &self.device_state {
+                    let form = SettingsFormMetrics::for_available_width(ui.available_width());
+                    ui.vertical(|ui| {
+                        for (label, value) in [
+                            (language.pick("型号", "Model"), state.info.model.as_str()),
+                            (language.pick("固件", "Firmware"), state.info.fw_version.as_str()),
+                            (language.pick("硬件", "Hardware"), state.info.hw_version.as_str()),
+                            (language.pick("序列号", "Serial number"), state.info.serial_id.as_str()),
+                        ] {
+                            settings_form_row(ui, form, label, SETTINGS_FORM_ROW_HEIGHT, |control| {
+                                control.allocate_ui_with_layout(
+                                    egui::vec2(form.control_width, 32.0),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        settings_text(ui, value, form.control_width, theme::text_primary());
+                                    },
+                                );
+                            });
+                        }
+                    });
+                } else {
+                    ui.label(
+                        egui::RichText::new(language.pick("未连接 KM003C", "KM003C is not connected"))
+                            .color(theme::muted_text()),
+                    );
+                }
+                egui::CollapsingHeader::new(language.pick("高级连接", "Advanced connection"))
+                    .default_open(false).show(ui, |ui| {
+                let form = SettingsFormMetrics::for_available_width(ui.available_width());
+                ui.vertical(|ui| {
+                        settings_form_row(
+                            ui,
+                            form,
+                            language.pick("高级连接", "Advanced connection"),
+                            48.0,
+                            |control| {
+                                control.checkbox(
+                                    &mut self.usb_reset,
+                                    language.pick(
+                                        "连接时执行 USB reset",
+                                        "Run USB reset when connecting",
+                                    ),
+                                )
+                                .on_hover_text(language.pick(
+                                    "macOS 默认跳过 USB reset；只在设备异常且你明确需要时开启。",
+                                    "USB reset is skipped by default on macOS. Enable it only when the device is malfunctioning and a reset is required.",
+                                ));
+                                control.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(language.pick(
+                                            "仅在设备异常时启用。",
+                                            "Enable only when the device is malfunctioning.",
+                                        ))
+                                        .small()
+                                        .color(theme::muted_text()),
+                                    )
+                                    .wrap(),
+                                );
+                            },
+                        );
+                    });
+                });
+            });
+        }
+
+        if self.settings_page == SettingsPage::Diagnostics {
+            settings_section(ui, language.pick("数据质量", "Data quality"), false, |ui| {
+                let form = SettingsFormMetrics::for_available_width(ui.available_width());
+                ui.vertical(|ui| {
+                    for (label, value) in [
+                        (
+                            language.pick("接收采样", "Received samples"),
+                            self.total_samples.to_string(),
+                        ),
+                        (
+                            language.pick("缺失采样", "Missing samples"),
+                            self.dropped_samples.to_string(),
+                        ),
+                        (
+                            language.pick("乱序/重复丢弃", "Out-of-order / duplicate samples discarded"),
+                            self.discarded_sequence_samples.to_string(),
+                        ),
+                        (
+                            language.pick("缓冲区", "Buffer"),
+                            format!("{} {}", self.data_points.len(), language.pick("点", "points")),
+                        ),
+                    ] {
+                        settings_form_row(ui, form, label, SETTINGS_FORM_ROW_HEIGHT, |control| {
+                            control
+                                .add_sized(
+                                    [form.control_width, SETTINGS_FORM_ROW_HEIGHT],
+                                    egui::Label::new(egui::RichText::new(&value).monospace())
+                                        .halign(egui::Align::Max)
+                                        .truncate(),
+                                )
+                                .on_hover_text(&value);
+                        });
+                    }
+                });
             });
 
-            if let Some(scan) = &self.recovery_scan {
-                match scan.try_recv() {
-                    Ok(cache) => {
-                        self.recovery_cache = Some(cache);
-                        self.recovery_scan = None;
+            settings_section(ui, language.pick("应用信息", "Application"), true, |ui| {
+                let form = SettingsFormMetrics::for_available_width(ui.available_width());
+                ui.vertical(|ui| {
+                    for (label, value) in [
+                        (
+                            language.pick("版本", "Version"),
+                            format!("{} v{APP_VERSION} ({APP_BUILD})", i18n::app_title(language)),
+                        ),
+                        (
+                            language.pick("底层核心", "Core"),
+                            "km003c-rs · MIT / Apache-2.0".to_string(),
+                        ),
+                        (
+                            language.pick("诊断日志", "Diagnostic logs"),
+                            "~/Library/Application Support/com.weixun.km003cworkbench/logs/".to_string(),
+                        ),
+                    ] {
+                        settings_form_row(ui, form, label, SETTINGS_FORM_ROW_HEIGHT, |control| {
+                            control.allocate_ui_with_layout(
+                                egui::vec2(form.control_width, 32.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    settings_text(ui, &value, form.control_width, theme::text_primary());
+                                },
+                            );
+                        });
                     }
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => self.recovery_scan = None,
-                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                }
-            }
-            if self.recovery_scan.is_none()
-                && self
-                    .recovery_cache
-                    .as_ref()
-                    .is_none_or(|cache| cache.updated.elapsed() >= Duration::from_secs(5))
-            {
-                let (tx, rx) = std::sync::mpsc::channel();
-                let ctx = ui.ctx().clone();
-                std::thread::spawn(move || {
-                    let _ = tx.send(RecoveryListCache {
-                        updated: Instant::now(),
-                        sessions: discover_recoverable_sessions(&application_recordings_directory().join("Pending")),
-                        files: recoverable_recordings(),
-                    });
-                    ctx.request_repaint();
                 });
-                self.recovery_scan = Some(rx);
-            }
-            let recoverable_sessions = self
-                .recovery_cache
-                .as_ref()
-                .map_or_else(Vec::new, |cache| cache.sessions.clone());
-            let recoverable = self
-                .recovery_cache
-                .as_ref()
-                .map_or_else(Vec::new, |cache| cache.files.clone());
-            if !recoverable_sessions.is_empty() || !recoverable.is_empty() {
-                let title = format!(
-                    "{} ({})",
-                    language.pick("可恢复录制", "Recoverable recordings"),
-                    recoverable_sessions.len() + recoverable.len()
+            });
+            settings_section(ui, language.pick("开源与声明", "Sources & notices"), false, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.hyperlink_to("okhsunrog/km003c-rs", "https://github.com/okhsunrog/km003c-rs");
+                    ui.separator();
+                    ui.hyperlink_to("KHWLGH/WITRN-RS", "https://github.com/KHWLGH/WITRN-RS");
+                });
+                ui.label(
+                    egui::RichText::new(language.pick(
+                        "基于 km003c-rs；维简式截图仅用于交互研究。本软件独立实现，不复制第三方代码、资源或品牌，也不是 ChargerLAB 官方软件。",
+                        "Built on km003c-rs. The WITRN-style screenshot was used only for interaction research. This independent implementation copies no third-party code, assets, or branding and is not official ChargerLAB software.",
+                    ))
+                    .small()
+                    .color(theme::text_secondary()),
                 );
-                settings_section(ui, &title, false, |ui| {
-                    let mut import_path = None;
-                    let mut view_session = None;
-                    let mut save_session = None;
-                    let mut continue_session = None;
-                    egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+            });
+        }
+    }
+
+    fn show_record_manager(&mut self, ctx: &egui::Context) {
+        let Some(page) = self.record_manager else {
+            return;
+        };
+        let language = self.language;
+        let mut open = true;
+        let metrics = SettingsLayoutMetrics::for_content_rect(ctx.content_rect());
+        egui::Window::new(language.pick("记录管理", "Recordings"))
+            .frame(egui::Frame::window(&ctx.style_of(egui::Theme::Dark)).fill(theme::panel().to_opaque()))
+            .id(egui::Id::new("record_manager_v1"))
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .fixed_size(metrics.window_size)
+            .resizable(false)
+            .collapsible(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.spacing_mut().interact_size.y = 32.0;
+                ui.horizontal(|ui| {
+                    for (tab, label) in [
+                        (RecordManagerPage::Recovery, language.pick("可恢复录制", "Recoverable")),
+                        (RecordManagerPage::OnDevice, language.pick("设备离线", "On-device")),
+                    ] {
+                        if settings_segment(ui, page == tab, 160.0, label) {
+                            self.record_manager = Some(tab);
+                        }
+                    }
+                });
+                ui.add_space(12.0);
+                match page {
+                    RecordManagerPage::Recovery => self.show_recoverable_recordings(ui),
+                    RecordManagerPage::OnDevice => self.show_on_device_recordings(ui),
+                }
+            });
+        if !open {
+            self.record_manager = None;
+        }
+    }
+
+    fn show_on_device_recordings(&mut self, ui: &mut egui::Ui) {
+        let language = self.language;
+        settings_text(
+            ui,
+            language.pick(
+                "在列表中选择一条记录，再下载并查看。刷新目录会保留所选记录。",
+                "Select a recording in the list, then download and view it. Refresh keeps your selection.",
+            ),
+            ui.available_width(),
+            theme::text_secondary(),
+        );
+        ui.add_space(8.0);
+        let available = self.device_state.is_some()
+            && self.recorder.is_none()
+            && !self.offline_busy
+            && self.offline_export.is_none();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(available, egui::Button::new(language.pick("刷新目录", "Refresh list")))
+                .clicked()
+            {
+                self.request_offline_catalog();
+            }
+            if self.recorder.is_some() {
+                ui.label(language.pick(
+                    "请先保存并结束当前录制。",
+                    "Save and finish the current recording first.",
+                ));
+            } else if self.device_state.is_none() {
+                ui.label(language.pick("请先连接 KM003C。", "Connect a KM003C first."));
+            }
+        });
+        ui.add_space(8.0);
+        ui.label(language.pick(
+            &format!("设备目录：{} 条记录", self.offline_catalog.len()),
+            &format!("Device catalog: {} recordings", self.offline_catalog.len()),
+        ));
+        let list_width = ui.available_width();
+        let list_height = (ui.available_height() - 160.0).max(140.0);
+        egui::ScrollArea::vertical()
+            .id_salt("device_recordings_list")
+            .max_height(list_height)
+            .min_scrolled_height(list_height)
+            .auto_shrink([false; 2])
+            .show(ui, |ui| {
+                let row_width = (list_width - ui.spacing().scroll.allocated_width()).max(0.0);
+                ui.set_width(row_width);
+                let mut download = None;
+                for (index, metadata) in self.offline_catalog.iter().enumerate() {
+                    let width = row_width;
+                    let action_width = 112.0;
+                    egui::Frame::NONE
+                        .fill(theme::panel_raised())
+                        .corner_radius(6)
+                        .inner_margin(egui::Margin::same(10))
+                        .show(ui, |ui| {
+                            ui.set_width((width - 20.0).max(0.0));
+                            let info_width = (width - 20.0 - action_width - 12.0).max(0.0);
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 12.0;
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(info_width, 42.0),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        ui.set_width(info_width);
+                                        if ui
+                                            .add_enabled(
+                                                !self.offline_busy,
+                                                egui::RadioButton::new(
+                                                    self.offline_selected == Some(index),
+                                                    metadata.filename_lossy(),
+                                                ),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.offline_selected = Some(index);
+                                        }
+                                        ui.monospace(format!("{} pts", metadata.sample_count));
+                                    },
+                                );
+                                if ui
+                                    .add_enabled_ui(available, |ui| {
+                                        ui.add_sized(
+                                            [action_width, 32.0],
+                                            egui::Button::new(language.pick("下载并查看", "Download / view")),
+                                        )
+                                    })
+                                    .inner
+                                    .clicked()
+                                {
+                                    download = Some(index);
+                                }
+                            });
+                            if self.offline_selected == Some(index) && !self.offline_status.is_empty() {
+                                ui.horizontal(|ui| {
+                                    if self.offline_busy {
+                                        ui.spinner();
+                                    }
+                                    settings_text(
+                                        ui,
+                                        &self.offline_status,
+                                        (info_width + action_width).max(0.0),
+                                        theme::text_secondary(),
+                                    );
+                                });
+                            }
+                        });
+                    ui.add_space(8.0);
+                }
+                if let Some(index) = download {
+                    self.offline_selected = Some(index);
+                    self.download_selected_offline_log();
+                }
+                if self.offline_catalog.is_empty() {
+                    settings_text(
+                        ui,
+                        language.pick(
+                            "暂无目录，请在设备上选择记录后刷新。",
+                            "No entries. Select a recording on the device and refresh.",
+                        ),
+                        ui.available_width(),
+                        theme::muted_text(),
+                    );
+                }
+            });
+        ui.separator();
+        ui.horizontal(|ui| {
+            if self.offline_busy || self.offline_export.is_some() {
+                ui.spinner();
+            }
+            settings_text(
+                ui,
+                &self.offline_status,
+                (ui.available_width() - 24.0).max(0.0),
+                theme::text_secondary(),
+            );
+        });
+        egui::CollapsingHeader::new(language.pick("完整状态／错误详情", "Full status / error details")).show(
+            ui,
+            |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("offline_error_details")
+                    .max_height(54.0)
+                    .show(ui, |ui| {
+                        ui.add(egui::Label::new(&self.offline_status).wrap().selectable(true));
+                    });
+                if ui.button(language.pick("复制详情", "Copy details")).clicked() {
+                    ui.ctx().copy_text(self.offline_status.clone());
+                }
+            },
+        );
+        if let Some(view) = &self.offline_view {
+            ui.label(language.pick(
+                &format!(
+                    "已下载：{}（下方操作仅针对这条记录）",
+                    view.log.metadata.filename_lossy()
+                ),
+                &format!(
+                    "Downloaded: {} (actions below apply to this recording)",
+                    view.log.metadata.filename_lossy()
+                ),
+            ));
+            ui.horizontal(|ui| {
+                if ui
+                    .button(language.pick("查看已下载记录", "View downloaded recording"))
+                    .clicked()
+                {
+                    self.plot_source = PlotSource::Offline;
+                    self.active_tab = WorkspaceTab::Monitor;
+                    self.chart_viewport.selection = None;
+                    self.cursor_readout = None;
+                    self.cursor_pinned = false;
+                    self.reset_plots_requested = true;
+                    self.record_manager = None;
+                }
+                if ui
+                    .add_enabled(
+                        !self.offline_busy && self.offline_export.is_none() && self.recorder.is_none(),
+                        egui::Button::new(language.pick("导出已下载记录", "Export downloaded recording")),
+                    )
+                    .clicked()
+                {
+                    self.export_offline_log();
+                }
+            });
+        }
+    }
+
+    fn show_recoverable_recordings(&mut self, ui: &mut egui::Ui) {
+        let language = self.language;
+        if let Some(scan) = &self.recovery_scan {
+            match scan.try_recv() {
+                Ok(cache) => {
+                    self.recovery_cache = Some(cache);
+                    self.recovery_scan = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.recovery_scan = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if self.recovery_scan.is_none()
+            && self
+                .recovery_cache
+                .as_ref()
+                .is_none_or(|cache| cache.updated.elapsed() >= Duration::from_secs(5))
+        {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let ctx = ui.ctx().clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(RecoveryListCache {
+                    updated: Instant::now(),
+                    sessions: discover_recoverable_sessions(&application_recordings_directory().join("Pending")),
+                    files: recoverable_recordings(),
+                });
+                ctx.request_repaint();
+            });
+            self.recovery_scan = Some(rx);
+        }
+        let recoverable_sessions = self
+            .recovery_cache
+            .as_ref()
+            .map_or_else(Vec::new, |cache| cache.sessions.clone());
+        let recoverable = self
+            .recovery_cache
+            .as_ref()
+            .map_or_else(Vec::new, |cache| cache.files.clone());
+        if !recoverable_sessions.is_empty() || !recoverable.is_empty() {
+            let title = format!(
+                "{} ({})",
+                language.pick("可恢复录制", "Recoverable recordings"),
+                recoverable_sessions.len() + recoverable.len()
+            );
+            settings_section(ui, &title, true, |ui| {
+                let mut import_path = None;
+                let mut view_session = None;
+                let mut save_session = None;
+                let mut continue_session = None;
+                egui::ScrollArea::vertical()
+                    .id_salt("recovery_list")
+                    .max_height((ui.available_height() - 90.0).max(160.0))
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| {
                         let session_card_width = ui.available_width();
-                        let session_inner_width = (session_card_width - 14.0).max(404.0);
+                        let session_inner_width = (session_card_width - 14.0).max(0.0);
                         for (directory, manifest) in &recoverable_sessions {
                             egui::Frame::NONE
                                 .fill(theme::panel())
@@ -8396,7 +8786,7 @@ impl PowerMonitorApp {
                                                         RECOVERABLE_SESSION_ACTION_GAP;
                                                     if actions
                                                         .add_sized(
-                                                            [RECOVERABLE_SESSION_SECONDARY_WIDTH, 28.0],
+                                                            [RECOVERABLE_SESSION_SECONDARY_WIDTH, 32.0],
                                                             egui::Button::new(language.pick("保存", "Save")),
                                                         )
                                                         .clicked()
@@ -8405,7 +8795,7 @@ impl PowerMonitorApp {
                                                     }
                                                     if actions
                                                         .add_sized(
-                                                            [RECOVERABLE_SESSION_SECONDARY_WIDTH, 28.0],
+                                                            [RECOVERABLE_SESSION_SECONDARY_WIDTH, 32.0],
                                                             egui::Button::new(language.pick("查看", "View")),
                                                         )
                                                         .clicked()
@@ -8417,7 +8807,7 @@ impl PowerMonitorApp {
                                                             !self.recording_session && self.device_state.is_some(),
                                                             |actions| {
                                                                 actions.add_sized(
-                                                                    [RECOVERABLE_SESSION_CONTINUE_WIDTH, 28.0],
+                                                                    [RECOVERABLE_SESSION_CONTINUE_WIDTH, 32.0],
                                                                     egui::Button::new(
                                                                         language.pick("继续录制", "Continue"),
                                                                     ),
@@ -8437,429 +8827,70 @@ impl PowerMonitorApp {
                             ui.add_space(4.0);
                         }
                         if !recoverable.is_empty() {
-                            let row_width = ui.available_width();
+                            let row_width = session_inner_width;
                             let (filename_width, button_width) = recoverable_file_columns(row_width);
                             for path in &recoverable {
                                 let name = path
                                     .file_name()
                                     .and_then(|name| name.to_str())
                                     .unwrap_or(language.pick("录制文件", "Recording file"));
-                                ui.allocate_ui_with_layout(
-                                    egui::vec2(row_width, 44.0),
-                                    egui::Layout::left_to_right(egui::Align::Center),
-                                    |row| {
-                                        row.spacing_mut().item_spacing.x = RECOVERABLE_FILE_COLUMN_GAP;
-                                        row.add_sized(
-                                            [filename_width, 40.0],
-                                            egui::Label::new(egui::RichText::new(name).monospace().small()).wrap(),
-                                        )
-                                        .on_hover_text(path.display().to_string());
-                                        if row
-                                            .add_sized(
-                                                [button_width, 28.0],
-                                                egui::Button::new(language.pick("导入", "Import")),
-                                            )
-                                            .clicked()
-                                        {
-                                            import_path = Some(path.clone());
-                                        }
-                                    },
-                                );
+                                egui::Frame::NONE
+                                    .inner_margin(egui::Margin::symmetric(7, 5))
+                                    .show(ui, |ui| {
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(row_width, 44.0),
+                                            egui::Layout::left_to_right(egui::Align::Center),
+                                            |row| {
+                                                row.spacing_mut().item_spacing.x = RECOVERABLE_FILE_COLUMN_GAP;
+                                                row.allocate_ui_with_layout(
+                                                    egui::vec2(filename_width, 40.0),
+                                                    egui::Layout::left_to_right(egui::Align::Center),
+                                                    |info| {
+                                                        settings_text(
+                                                            info,
+                                                            name,
+                                                            filename_width,
+                                                            theme::text_secondary(),
+                                                        )
+                                                        .on_hover_text(path.display().to_string());
+                                                    },
+                                                );
+                                                if row
+                                                    .add_sized(
+                                                        [button_width, 32.0],
+                                                        egui::Button::new(language.pick("导入", "Import")),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    import_path = Some(path.clone());
+                                                }
+                                            },
+                                        );
+                                    });
                                 ui.add_space(4.0);
                             }
                         }
                     });
-                    if let Some(path) = import_path {
-                        self.start_recording_import(path);
-                    }
-                    if let Some((directory, manifest)) = view_session {
-                        self.open_recoverable_session(directory, manifest);
-                    }
-                    if let Some((directory, manifest)) = save_session {
-                        self.save_recoverable_session(directory, manifest);
-                    }
-                    if let Some((directory, manifest)) = continue_session {
-                        self.continue_recoverable_session(directory, manifest);
-                    }
-                });
-            }
-        }
-
-        if self.settings_page == SettingsPage::Chart {
-            settings_section(ui, language.pick("图表", "Chart"), true, |ui| {
-                let previous_window = self.time_window;
-                let form = SettingsFormMetrics::for_available_width(ui.available_width());
-                egui::Grid::new("settings_chart_grid")
-                    .num_columns(2)
-                    .spacing([form.column_gap, 8.0])
-                    .show(ui, |ui| {
-                        settings_form_row(
-                            ui,
-                            form,
-                            language.pick("默认时间窗", "Default time window"),
-                            SETTINGS_FORM_ROW_HEIGHT,
-                            |control| {
-                                egui::ComboBox::from_id_salt("settings_time_window")
-                                    .width(form.control_width)
-                                    .selected_text(self.time_window.localized_label(language))
-                                    .show_ui(control, |control| {
-                                        for window in TimeWindow::all() {
-                                            control.selectable_value(
-                                                &mut self.time_window,
-                                                *window,
-                                                window.localized_label(language),
-                                            );
-                                        }
-                                    });
-                            },
-                        );
-
-                        settings_form_row(
-                            ui,
-                            form,
-                            language.pick("坐标显示", "Axis display"),
-                            SETTINGS_CHOICE_CARD_HEIGHT,
-                            |control| {
-                                let card_gap = 8.0;
-                                let card_width = settings_equal_column_width(form.control_width, 2, card_gap);
-                                control.horizontal(|cards| {
-                                    cards.spacing_mut().item_spacing.x = card_gap;
-                                    for mode in ChartScaleMode::ALL {
-                                        let selected = self.chart_scale_mode == mode;
-                                        if settings_choice_card(
-                                            cards,
-                                            card_width,
-                                            selected,
-                                            mode.localized_label(language),
-                                            mode.localized_description(language),
-                                        ) {
-                                            self.chart_scale_mode = mode;
-                                        }
-                                    }
-                                });
-                            },
-                        );
-
-                        settings_form_row(
-                            ui,
-                            form,
-                            language.pick("曲线降噪", "Trace smoothing"),
-                            SETTINGS_FORM_ROW_HEIGHT,
-                            |control| {
-                                let filter_response = egui::ComboBox::from_id_salt("settings_display_filter")
-                                    .width(form.control_width)
-                                    .selected_text(self.display_filter.localized_label(language))
-                                    .show_ui(control, |control| {
-                                        for filter in [DisplayFilter::Median5, DisplayFilter::Raw] {
-                                            control.selectable_value(
-                                                &mut self.display_filter,
-                                                filter,
-                                                filter.localized_label(language),
-                                            );
-                                        }
-                                    });
-                                filter_response.response.on_hover_text(language.pick(
-                                    "五点中值滤波只改变屏幕曲线；游标、统计、录制和导出始终使用原始采样。",
-                                    "The 5-point median filter affects only the displayed traces. Cursor values, statistics, recordings, and exports always use raw samples.",
-                                ));
-                            },
-                        );
-
-                        settings_form_row(
-                            ui,
-                            form,
-                            language.pick("累计曲线", "Cumulative traces"),
-                            SETTINGS_FORM_ROW_HEIGHT,
-                            |control| {
-                                control.horizontal(|control| {
-                                    control.spacing_mut().item_spacing.x = 16.0;
-                                    control.checkbox(
-                                        &mut self.visible_accumulated_series[0],
-                                        language.pick("累计能量", "Energy"),
-                                    );
-                                    control.checkbox(
-                                        &mut self.visible_accumulated_series[1],
-                                        language.pick("累计容量", "Capacity"),
-                                    );
-                                });
-                            },
-                        );
-
-                        let plot_source = self.plot_source;
-                        settings_form_row(
-                            ui,
-                            form,
-                            language.pick("高级曲线", "Advanced traces"),
-                            42.0,
-                            |control| {
-                                let gap = 8.0;
-                                let trace_width = settings_equal_column_width(form.control_width, 3, gap);
-                                control.horizontal(|traces| {
-                                    traces.spacing_mut().item_spacing.x = gap;
-                                    for (index, metric) in self.plot_metrics.iter_mut().enumerate() {
-                                        let selected_label = metric.localized_label(language);
-                                        let response = egui::ComboBox::from_id_salt(("advanced_metric", index))
-                                            .width(trace_width)
-                                            .truncate()
-                                            .selected_text(selected_label)
-                                            .show_ui(traces, |traces| {
-                                                for option in PlotMetric::ALL {
-                                                    if plot_source != PlotSource::Offline || option.supports_offline() {
-                                                        traces.selectable_value(
-                                                            metric,
-                                                            option,
-                                                            option.localized_label(language),
-                                                        );
-                                                    }
-                                                }
-                                            });
-                                        response.response.on_hover_text(selected_label);
-                                    }
-                                });
-                            },
-                        );
-
-                        settings_form_row(
-                            ui,
-                            form,
-                            language.pick("高级分析", "Analysis"),
-                            SETTINGS_FORM_ROW_HEIGHT,
-                            |control| {
-                                if control
-                                    .button(language.pick("打开高级分析窗口", "Open Advanced Analysis"))
-                                    .clicked()
-                                {
-                                    self.advanced_analysis_open = true;
-                                }
-                            },
-                        );
-                    });
-                if self.time_window != previous_window {
-                    self.chart_follow_mode = if self.time_window == TimeWindow::All {
-                        ChartFollowMode::FullSession
-                    } else {
-                        ChartFollowMode::LatestWindow
-                    };
-                    self.chart_viewport.selection = None;
+                if let Some(path) = import_path {
+                    self.start_recording_import(path);
+                }
+                if let Some((directory, manifest)) = view_session {
+                    self.open_recoverable_session(directory, manifest);
+                }
+                if let Some((directory, manifest)) = save_session {
+                    self.save_recoverable_session(directory, manifest);
+                }
+                if let Some((directory, manifest)) = continue_session {
+                    self.continue_recoverable_session(directory, manifest);
                 }
             });
-        }
-
-        if self.settings_page == SettingsPage::DataAndDevice {
-            settings_section(ui, language.pick("数据质量", "Data quality"), false, |ui| {
-                let form = SettingsFormMetrics::for_available_width(ui.available_width());
-                egui::Grid::new("settings_data_quality")
-                    .num_columns(2)
-                    .spacing([form.column_gap, 6.0])
-                    .show(ui, |ui| {
-                        for (label, value) in [
-                            (
-                                language.pick("接收采样", "Received samples"),
-                                self.total_samples.to_string(),
-                            ),
-                            (
-                                language.pick("缺失采样", "Missing samples"),
-                                self.dropped_samples.to_string(),
-                            ),
-                            (
-                                language.pick("乱序/重复丢弃", "Out-of-order / duplicate samples discarded"),
-                                self.discarded_sequence_samples.to_string(),
-                            ),
-                            (
-                                language.pick("缓冲区", "Buffer"),
-                                format!("{} {}", self.data_points.len(), language.pick("点", "points")),
-                            ),
-                        ] {
-                            settings_form_row(ui, form, label, SETTINGS_FORM_ROW_HEIGHT, |control| {
-                                control
-                                    .add_sized(
-                                        [form.control_width, SETTINGS_FORM_ROW_HEIGHT],
-                                        egui::Label::new(egui::RichText::new(&value).monospace()).truncate(),
-                                    )
-                                    .on_hover_text(&value);
-                            });
-                        }
-                    });
-            });
-
-            settings_section(
+        } else {
+            settings_text(
                 ui,
-                language.pick("设备离线记录", "On-device recordings"),
-                true,
-                |ui| {
-                    ui.label(language.pick(
-                        "先在 KM003C 上选择已保存的离线记录，再刷新并下载。录制期间请先结束当前会话。",
-                        "Select a saved log on the KM003C, then refresh and download. Finish the current recording first.",
-                    ));
-                    let form = SettingsFormMetrics::for_available_width(ui.available_width());
-                    egui::Grid::new("settings_offline_controls")
-                        .num_columns(2)
-                        .spacing([form.column_gap, 6.0])
-                        .show(ui, |ui| {
-                            settings_form_row(
-                                ui,
-                                form,
-                                language.pick("目录", "Catalog"),
-                                SETTINGS_FORM_ROW_HEIGHT,
-                                |control| {
-                                    control.horizontal(|control| {
-                                        if control
-                                            .add_enabled(
-                                                self.device_state.is_some()
-                                                    && !self.offline_busy
-                                                    && self.recorder.is_none()
-                                                    && self.offline_export.is_none(),
-                                                egui::Button::new(language.pick("刷新目录", "Refresh list")),
-                                            )
-                                            .clicked()
-                                        {
-                                            self.request_offline_catalog();
-                                        }
-                                        if self.offline_busy {
-                                            control.spinner();
-                                        }
-                                    });
-                                },
-                            );
-                            if !self.offline_catalog.is_empty() {
-                                let selected_text = self
-                                    .offline_selected
-                                    .and_then(|index| self.offline_catalog.get(index))
-                                    .map_or_else(
-                                        || language.pick("选择记录", "Select a recording").to_string(),
-                                        |metadata| metadata.filename_lossy().into_owned(),
-                                    );
-                                settings_form_row(
-                                    ui,
-                                    form,
-                                    language.pick("选择记录", "Recording"),
-                                    SETTINGS_FORM_ROW_HEIGHT,
-                                    |control| {
-                                        let response = egui::ComboBox::from_id_salt("settings_offline_recording")
-                                            .width(form.control_width)
-                                            .truncate()
-                                            .selected_text(selected_text.clone())
-                                            .show_ui(control, |control| {
-                                                for (index, metadata) in self.offline_catalog.iter().enumerate() {
-                                                    control.selectable_value(
-                                                        &mut self.offline_selected,
-                                                        Some(index),
-                                                        format!(
-                                                            "{} · {} {}",
-                                                            metadata.filename_lossy(),
-                                                            metadata.sample_count,
-                                                            language.pick("点", "points")
-                                                        ),
-                                                    );
-                                                }
-                                            });
-                                        response.response.on_hover_text(selected_text);
-                                    },
-                                );
-                                settings_form_row(
-                                    ui,
-                                    form,
-                                    language.pick("操作", "Actions"),
-                                    SETTINGS_FORM_ROW_HEIGHT,
-                                    |control| {
-                                        if control
-                                            .add_enabled(
-                                                self.offline_selected.is_some()
-                                                    && !self.offline_busy
-                                                    && self.recorder.is_none(),
-                                                egui::Button::new(language.pick("下载并查看", "Download and view")),
-                                            )
-                                            .clicked()
-                                        {
-                                            self.download_selected_offline_log();
-                                        }
-                                    },
-                                );
-                            }
-                            if self.offline_view.is_some() {
-                                settings_form_row(
-                                    ui,
-                                    form,
-                                    language.pick("导出", "Export"),
-                                    SETTINGS_FORM_ROW_HEIGHT,
-                                    |control| {
-                                        if control
-                                            .add_enabled(
-                                                self.offline_export.is_none() && self.recorder.is_none(),
-                                                egui::Button::new(
-                                                    language.pick("导出已下载记录", "Export downloaded recording"),
-                                                ),
-                                            )
-                                            .clicked()
-                                        {
-                                            self.export_offline_log();
-                                        }
-                                    },
-                                );
-                            }
-                        });
-                    let offline_status = if self.offline_status == "尚未加载设备离线记录" {
-                        language.pick("尚未加载设备离线记录", "No on-device recordings have been loaded")
-                    } else {
-                        &self.offline_status
-                    };
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(offline_status).small().color(theme::muted_text())).wrap(),
-                    );
-                },
+                language.pick("没有待恢复的录制。", "No recoverable recordings."),
+                ui.available_width(),
+                theme::muted_text(),
             );
-        }
-
-        if self.settings_page == SettingsPage::Diagnostics {
-            settings_section(ui, language.pick("应用信息", "Application"), true, |ui| {
-                let form = SettingsFormMetrics::for_available_width(ui.available_width());
-                egui::Grid::new("settings_application_info")
-                    .num_columns(2)
-                    .spacing([form.column_gap, 6.0])
-                    .show(ui, |ui| {
-                        for (label, value) in [
-                            (
-                                language.pick("版本", "Version"),
-                                format!("{} v{APP_VERSION} ({APP_BUILD})", i18n::app_title(language)),
-                            ),
-                            (
-                                language.pick("底层核心", "Core"),
-                                "km003c-rs · MIT / Apache-2.0".to_string(),
-                            ),
-                            (
-                                language.pick("诊断日志", "Diagnostic logs"),
-                                "~/Library/Application Support/com.weixun.km003cworkbench/logs/".to_string(),
-                            ),
-                        ] {
-                            settings_form_row(ui, form, label, SETTINGS_FORM_ROW_HEIGHT, |control| {
-                                control
-                                    .add_sized(
-                                        [form.control_width, SETTINGS_FORM_ROW_HEIGHT],
-                                        egui::Label::new(
-                                            egui::RichText::new(&value).monospace().color(theme::text_primary()),
-                                        )
-                                        .truncate(),
-                                    )
-                                    .on_hover_text(&value);
-                            });
-                        }
-                    });
-            });
-            settings_section(ui, language.pick("开源与声明", "Sources & notices"), false, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.hyperlink_to("okhsunrog/km003c-rs", "https://github.com/okhsunrog/km003c-rs");
-                    ui.separator();
-                    ui.hyperlink_to("KHWLGH/WITRN-RS", "https://github.com/KHWLGH/WITRN-RS");
-                });
-                ui.label(
-                    egui::RichText::new(language.pick(
-                        "基于 km003c-rs；维简式截图仅用于交互研究。本软件独立实现，不复制第三方代码、资源或品牌，也不是 ChargerLAB 官方软件。",
-                        "Built on km003c-rs. The WITRN-style screenshot was used only for interaction research. This independent implementation copies no third-party code, assets, or branding and is not official ChargerLAB software.",
-                    ))
-                    .small()
-                    .color(theme::text_secondary()),
-                );
-            });
         }
     }
 
@@ -8887,9 +8918,28 @@ impl PowerMonitorApp {
                     );
                 });
                 let selection = self.ensure_chart_selection();
-                let plot_height = ((ui.available_height() - 28.0) / 3.0).max(110.0);
+                let plot_height = ((ui.available_height() - 28.0) / 3.0 - 40.0).max(110.0);
                 let maximum_points = (ui.available_width() * 2.0) as usize;
-                for (index, metric) in self.plot_metrics.into_iter().enumerate() {
+                for index in 0..self.plot_metrics.len() {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{} {}", language.pick("曲线", "Trace"), index + 1));
+                        egui::ComboBox::from_id_salt(("analysis_metric", index))
+                            .width(240.0)
+                            .truncate()
+                            .selected_text(self.plot_metrics[index].localized_label(language))
+                            .show_ui(ui, |ui| {
+                                for option in PlotMetric::ALL {
+                                    if self.plot_source != PlotSource::Offline || option.supports_offline() {
+                                        ui.selectable_value(
+                                            &mut self.plot_metrics[index],
+                                            option,
+                                            option.localized_label(language),
+                                        );
+                                    }
+                                }
+                            });
+                    });
+                    let metric = self.plot_metrics[index];
                     let points = self.source_metric_points(metric, selection, maximum_points);
                     Plot::new(("advanced_analysis_plot", index))
                         .height(plot_height)
@@ -10271,8 +10321,8 @@ mod tests {
             assert!(!page.localized_description(Language::SimplifiedChinese).is_empty());
             assert!(!page.localized_description(Language::English).is_empty());
         }
-        assert_eq!(Language::SimplifiedChinese.short_name(), "简中");
-        assert_eq!(Language::English.short_name(), "EN");
+        assert_eq!(Language::SimplifiedChinese.native_name(), "简体中文");
+        assert_eq!(Language::English.native_name(), "English");
     }
 
     #[test]
@@ -10306,10 +10356,10 @@ mod tests {
         );
         assert_eq!(SkinId::CleanAnime.localized_label(Language::English), "Japanese style");
         assert_eq!(
-            SkinId::Industrial.localized_short_label(Language::SimplifiedChinese),
+            SkinId::Industrial.localized_label(Language::SimplifiedChinese),
             "工业仪器"
         );
-        assert_eq!(SkinId::CleanAnime.localized_short_label(Language::English), "Japanese");
+        assert_eq!(SkinId::CleanAnime.localized_label(Language::English), "Japanese style");
         let mut value = serde_json::to_value(AppPreferences::default()).unwrap();
         value
             .as_object_mut()
@@ -10378,13 +10428,171 @@ mod tests {
     }
 
     #[test]
+    fn form_rows_measure_multiline_controls_before_placing_the_next_row() {
+        let ctx = egui::Context::default();
+        for language in Language::ALL {
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui.set_width(580.0);
+                let form = SettingsFormMetrics::for_available_width(580.0);
+                let mut first_bounds = egui::Rect::NOTHING;
+                let mut second_top = 0.0;
+                ui.vertical(|ui| {
+                    settings_form_row(
+                        ui,
+                        form,
+                        language.pick("坐标显示", "Axis display"),
+                        38.0,
+                        |control| {
+                            control.label("Actual / Relative");
+                            settings_text(
+                                control,
+                                &"A long explanation ".repeat(20),
+                                form.control_width,
+                                theme::muted_text(),
+                            );
+                            first_bounds = control.min_rect();
+                        },
+                    );
+                    settings_form_row(
+                        ui,
+                        form,
+                        language.pick("曲线降噪", "Trace smoothing"),
+                        38.0,
+                        |control| {
+                            second_top = control.next_widget_position().y;
+                            let _ = control.button("Raw");
+                        },
+                    );
+                });
+                assert!(second_top >= first_bounds.bottom(), "{first_bounds:?} vs {second_top}");
+                assert!(first_bounds.width() <= form.control_width + 1.0);
+            });
+        }
+    }
+
+    #[test]
+    fn source_quality_and_export_do_not_leak_live_state_into_offline_views() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let (cmd, _commands) = mpsc::unbounded_channel();
+        let mut app = PowerMonitorApp::new(rx, cmd);
+        app.total_samples = 100;
+        app.dropped_samples = 77;
+        assert_eq!(app.source_quality_counts(), Some((77, 0)));
+        app.plot_source = PlotSource::Offline;
+        app.offline_view = Some(Arc::new(captured_test_view()));
+        assert_eq!(app.source_quality_counts(), None);
+        app.plot_source = PlotSource::Imported;
+        app.imported_recording = Some(ImportedRecording {
+            path: PathBuf::from("example.csv"),
+            samples: Arc::new(vec![test_measurement(0.0)]),
+            metadata: None,
+        });
+        assert_eq!(app.source_quality_counts(), None);
+        assert!(app.can_export_current_source());
+        app.imported_recording.as_mut().unwrap().metadata = Some(RecordingSessionMetadataV1::default());
+        assert_eq!(app.source_quality_counts(), Some((0, 0)));
+        app.recording_phase = RecordingPhase::Paused;
+        app.return_to_live();
+        assert_eq!(app.plot_source, PlotSource::Live);
+        assert_eq!(app.recording_phase, RecordingPhase::Paused);
+        assert_eq!(app.total_samples, 100);
+    }
+
+    #[test]
+    fn compact_chart_reserves_the_full_navigator_height() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let (cmd, _commands) = mpsc::unbounded_channel();
+        let mut app = PowerMonitorApp::new(rx, cmd);
+        app.visible_accumulated_series = [true, true];
+        let ctx = egui::Context::default();
+        for language in Language::ALL {
+            app.language = language;
+            for _ in 0..3 {
+                let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    let rect = egui::Rect::from_min_size(ui.next_widget_position(), egui::vec2(740.0, 580.0));
+                    let mut chart = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(rect)
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                    );
+                    app.show_combined_monitor_chart(&mut chart, true);
+                    assert!(chart.min_rect().bottom() <= rect.bottom(), "{:?}", chart.min_rect());
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn settings_window_stays_inside_each_supported_screen() {
+        for size in [[1024.0, 700.0], [1280.0, 820.0], [1728.0, 1117.0]] {
+            for language in Language::ALL {
+                let (_tx, rx) = mpsc::unbounded_channel();
+                let (cmd, _commands) = mpsc::unbounded_channel();
+                let mut app = PowerMonitorApp::new(rx, cmd);
+                app.language = language;
+                app.settings_open = true;
+                let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(size[0], size[1]));
+                let ctx = egui::Context::default();
+                for page in SettingsPage::ALL {
+                    app.settings_page = page;
+                    for _ in 0..3 {
+                        let _ = ctx.run_ui(
+                            egui::RawInput {
+                                screen_rect: Some(screen),
+                                ..Default::default()
+                            },
+                            |ui| {
+                                app.show_settings_window(ui.ctx());
+                            },
+                        );
+                    }
+                    let bounds = ctx
+                        .memory(|memory| memory.area_rect(egui::Id::new("settings_window_compact_v3")))
+                        .unwrap();
+                    assert!(
+                        screen.contains_rect(bounds),
+                        "{size:?} {language:?} {page:?}: {bounds:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn settings_pages_do_not_mutate_recording_or_chart_state() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let (cmd, _commands) = mpsc::unbounded_channel();
+        let mut app = PowerMonitorApp::new(rx, cmd);
+        app.recording_phase = RecordingPhase::Recording;
+        app.recording_session = true;
+        app.total_samples = 100;
+        app.cursor_pinned = true;
+        app.chart_follow_mode = ChartFollowMode::Manual;
+        let ctx = egui::Context::default();
+        for language in Language::ALL {
+            app.language = language;
+            for page in SettingsPage::ALL {
+                app.settings_page = page;
+                let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    ui.set_width(600.0);
+                    app.show_settings_content(ui);
+                });
+                assert_eq!(app.recording_phase, RecordingPhase::Recording);
+                assert_eq!(app.total_samples, 100);
+                assert!(app.cursor_pinned);
+                assert_eq!(app.chart_follow_mode, ChartFollowMode::Manual);
+            }
+        }
+    }
+
+    #[test]
     fn settings_form_columns_leave_room_for_both_languages() {
-        assert_eq!(SETTINGS_FORM_LABEL_WIDTH, 168.0);
-        assert_eq!(settings_control_width(680.0), 500.0);
-        assert_eq!(settings_control_width(400.0), 220.0);
+        assert_eq!(SETTINGS_FORM_LABEL_WIDTH, 144.0);
+        assert_eq!(settings_control_width(680.0), 524.0);
+        assert_eq!(settings_control_width(400.0), 244.0);
         let metrics = SettingsFormMetrics::for_available_width(680.0);
-        assert_eq!(metrics.label_width, 168.0);
-        assert_eq!(metrics.control_width, 500.0);
+        assert_eq!(metrics.label_width, 144.0);
+        assert_eq!(metrics.control_width, 524.0);
         assert_eq!(metrics.column_gap, 12.0);
     }
 
@@ -10681,6 +10889,49 @@ mod tests {
         assert_eq!(app.plot_metrics[0], PlotMetric::Voltage);
         assert_eq!(app.offline_view.as_ref().unwrap().samples.len(), 3);
         assert!(!app.offline_busy);
+    }
+
+    #[test]
+    fn offline_catalog_refresh_preserves_selected_record_after_reordering() {
+        let (usb_tx, usb_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let mut app = PowerMonitorApp::new(usb_rx, cmd_tx);
+        let first = captured_test_view().log.metadata.clone();
+        let mut second = first.clone();
+        second.filename_raw[0] = b'B';
+        second.data_offset += 4096;
+        app.offline_catalog = vec![first.clone(), second.clone()];
+        app.offline_selected = Some(1);
+        usb_tx
+            .send(UsbMessage::OfflineCatalog(vec![second.clone(), first.clone()]))
+            .unwrap();
+        app.process_messages();
+        assert_eq!(app.offline_selected, Some(0));
+        assert_eq!(app.offline_catalog[0], second);
+        usb_tx.send(UsbMessage::OfflineCatalog(vec![first])).unwrap();
+        app.process_messages();
+        assert_eq!(app.offline_selected, Some(0));
+        assert_eq!(app.offline_catalog.len(), 1);
+    }
+
+    #[test]
+    fn offline_download_sends_only_the_selected_record() {
+        let (_usb_tx, usb_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let mut app = PowerMonitorApp::new(usb_rx, cmd_tx);
+        app.enable_demo_device();
+        let first = captured_test_view().log.metadata.clone();
+        let mut second = first.clone();
+        second.filename_raw[0] = b'B';
+        second.data_offset += 4096;
+        app.offline_catalog = vec![first, second.clone()];
+        app.offline_selected = Some(1);
+        app.download_selected_offline_log();
+        match cmd_rx.try_recv().unwrap() {
+            UsbCommand::DownloadOfflineLog(metadata) => assert_eq!(metadata, second),
+            _ => panic!("expected a single-record download"),
+        }
+        assert!(cmd_rx.try_recv().is_err());
     }
 
     #[test]

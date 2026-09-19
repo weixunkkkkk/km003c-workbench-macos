@@ -1,6 +1,6 @@
 # KM003C 工作台移交文档
 
-更新日期：2026-09-19。源码基线：`f6ed197`；本次工作区修订已打包并安装本地，尚未提交或发布到 GitHub。
+更新日期：2026-09-19。源码基线：`7c3e248`；本次工作区修订已提交到 `main`，并发布为 `v0.1.0-20260919-2`。
 
 ## 接手结论
 
@@ -17,13 +17,13 @@
 | 工作分支 | `macos-workbench`，跟踪 `github/main` |
 | 用户远程 | `github` |
 | 上游远程 | `origin` → `okhsunrog/km003c-rs` |
-| App 版本 | `0.1.0 (1)` |
+| App 版本 | `0.1.0 (3)` |
 | Cargo workspace 版本 | `0.3.0`，与 App 版本不同 |
 | Bundle ID | `com.weixun.km003cworkbench` |
 | 系统与架构 | macOS 11+，arm64 / x86_64 Universal |
 | 可执行文件名 | `KM003CWorkbench` |
 
-重要提交：`4d8694c` 修复后台逻辑调度并更新设置与皮肤；`f6ed197` 修复发布标签校验及二进制打包路径。
+重要提交：`4d8694c` 修复后台逻辑调度并更新设置与皮肤；`f6ed197` 修复发布标签校验及二进制打包路径；`49f511c` 完成离线记录选择、记录管理和来源导出修订；`7c3e248` 同步发布规则和说明。
 
 GitHub 手动验证运行 [34184683051](https://github.com/weixunkkkkk/km003c-workbench-macos/actions/runs/34184683051) 已查询确认成功：版本校验、Linux、Windows、macOS Universal 构建全部通过。该运行是 `workflow_dispatch`，发布步骤按设计跳过。
 
@@ -31,6 +31,12 @@ GitHub 手动验证运行 [34184683051](https://github.com/weixunkkkkk/km003c-wo
 
 ```text
 d60b87cac14e246445c6c7f630e74fee252379a5ad53e871b6760750e60a1d87
+```
+
+最新公开发行：[v0.1.0-20260919-2](https://github.com/weixunkkkkk/km003c-workbench-macos/releases/tag/v0.1.0-20260919-2)。当前 DMG 位于 `dist/offline-selection-20260919/`，SHA-256：
+
+```text
+5505f1f6f8606a952b6c2223316a1c39b32d174f4b545eab28d1d68e74dd077c
 ```
 
 安装位置是 `/Applications/KM003C 工作台.app`。2026-09-19 已重新安装并启动验收，确认“更多 → 重新测量”入口存在。发行包使用 ad-hoc 签名，尚未 Apple 公证。
@@ -45,14 +51,14 @@ d60b87cac14e246445c6c7f630e74fee252379a5ad53e871b6760750e60a1d87
 | Active protocol 为 unconfirmed | 当前实现要求捕获 Source Capabilities → Request → Accept → PS_RDY；启动晚于协商时可能缺报文 | 从接线前启动采集重测；保留报文日志，不能按 VBUS 猜协议 |
 | Recording 时设置迟钝 | 恢复页原先每帧枚举磁盘并读取 manifest；工作区修订为后台线程扫描、五秒缓存，同一时刻只运行一次扫描 | 大量恢复记录、1000 SPS 下测响应；仍应评估图表计算开销 |
 
-本表中的“工作区修订”已包含在 2026-09-19 本地安装包中，但未发布到 GitHub。继续工作时先看 `git diff` 与本次测试结果。
+本表中的“工作区修订”已包含在 2026-09-19 本地安装包和 `v0.1.0-20260919-2` Release 中。继续工作时先看 `git status`、最新提交和本次测试结果。
 
-本次验证：`cargo check --locked -p km003c-egui`、格式检查、`git diff --check`、GUI crate 全部测试（92 通过，3 项设备/外部文件相关测试跳过）及 `cargo clippy --locked -p km003c-egui --all-targets -- -D warnings` 通过。新增暂停会话重新测量回归测试。Universal Release、DMG 挂载与完整性、签名和安装副本逐文件一致性检查通过；已检查本地启动待机画面与重新测量菜单。当前未发现 KM003C，真机尚未验证；未找到用户所述退出错误对应的 panic 或 KM003C 崩溃报告。
+本次验证：格式检查、`git diff --check`、GUI crate 全部测试（99 通过，3 项设备/外部文件相关测试跳过）及 `cargo clippy --workspace --all-targets --locked -- -D warnings` 通过。新增离线目录选择、来源导出、原格式副本和窗口布局回归测试。Universal Release、DMG 挂载与完整性、签名和远端下载校验通过；已检查本地启动待机画面、记录管理和重新测量菜单。当前未发现 KM003C，真机尚未验证；未找到用户所述退出错误对应的 panic 或 KM003C 崩溃报告。
 
 本地交付记录（2026-09-19）：
 
-- DMG：`dist/KM003C-Workbench-v0.1.0-macOS-universal.dmg`
-- DMG SHA-256：`1e4dd971657dc1de802e40523352efd98ecd74833ae4d43a45f997d7a6b6bc01`
+- DMG：`dist/offline-selection-20260919/KM003C-Workbench-v0.1.0-macOS-universal.dmg`
+- DMG SHA-256：`5505f1f6f8606a952b6c2223316a1c39b32d174f4b545eab28d1d68e74dd077c`
 - 已安装 executable SHA-256：`177114ad6159e779ddeb1ea5801e7ba74a4da52ca3ad9721dfdc5b664035723e`
 - 旧版备份：`release/rollback/install-20260919/KM003C 工作台.app`
 - 安装前通过实际窗口确认没有录制，正常退出；未修改用户配置和 Pending 恢复数据。
@@ -133,7 +139,7 @@ python3 -m unittest discover -s Scripts -p test_release_version.py
 
 `build_release.sh` 依次执行 `package_app.sh`、`make_dmg.sh`、`verify_dmg.sh`。构建需要 Rust（当前 Cargo 声明最低 1.97）、Xcode 命令行工具以及两个 macOS Rust target。产物在 `dist/`。
 
-发布标签从 `Distribution/Info.plist` 的 App 版本校验，支持 `v0.1.0` 与 `v0.1.0-YYYYMMDD`。不能拿 workspace 的 `0.3.0` 校验应用标签。当前 DMG 名称仍固定含 `v0.1.0`；以后升级 App 版本时检查 plist、打包脚本和文件名的一致性。
+发布标签从 `Distribution/Info.plist` 的 App 版本校验，支持 `v0.1.0`、`v0.1.0-YYYYMMDD` 和同日构建序号 `v0.1.0-YYYYMMDD-N`。不能拿 workspace 的 `0.3.0` 校验应用标签。当前 DMG 名称仍固定含 `v0.1.0`；以后升级 App 版本时检查 plist、打包脚本和文件名的一致性。
 
 GitHub workflow 构建的是跨平台二进制压缩包，标签触发时生成草稿 Release；手动触发只验证、不发布。macOS App/DMG 由本地脚本生成，不能将 CI 的 tar.gz 当作 DMG。
 

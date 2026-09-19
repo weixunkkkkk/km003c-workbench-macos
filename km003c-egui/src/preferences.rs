@@ -28,16 +28,6 @@ impl SkinId {
         }
     }
 
-    /// A compact label for fixed-width toolbar controls.  The full label is
-    /// still used in settings, while this version keeps the header stable in
-    /// both locales and at the compact window density.
-    pub(crate) const fn localized_short_label(self, language: Language) -> &'static str {
-        match self {
-            Self::Industrial => language.pick("工业仪器", "Industrial"),
-            Self::CleanAnime => language.pick("日系风格", "Japanese"),
-        }
-    }
-
     pub(crate) const fn localized_description(self, language: Language) -> &'static str {
         match self {
             Self::Industrial => language.pick(

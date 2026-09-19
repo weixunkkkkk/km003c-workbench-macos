@@ -11,6 +11,12 @@
   <a href="https://github.com/okhsunrog/km003c-rs/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/okhsunrog/km003c-rs/actions/workflows/ci.yml/badge.svg"></a>
 </p>
 
+The latest macOS application revision is
+[`v0.1.0-20260919-2`](https://github.com/weixunkkkkk/km003c-workbench-macos/releases/tag/v0.1.0-20260919-2).
+It keeps App version `0.1.0 (3)` while using a date-suffixed tag and an optional
+same-day build number to distinguish packaged revisions; the KM003C 23-column
+recording contract is unchanged.
+
 ## Overview
 
 `km003c-rs` provides asynchronous device communication, recorded-packet
@@ -87,10 +93,13 @@ GUI application featuring:
 - Recording duration, direction-independent cumulative energy, accumulated capacity, signed net energy, and optional sustained-low-power auto-pause
 - Strict import of KM003C 23-column Parquet/CSV recordings with schema and timestamp validation
 - Device-stored offline recording catalog, download, plotting, and Parquet/CSV export
+- A dedicated record manager with stable catalog selection, source-aware export,
+  and unchanged-copy export for imported files with their metadata sidecar
 - Host-integrated charge and energy with explicit missing-sample quality data
 - A typed current-protocol card that confirms Fixed/PPS/EPR/AVS only after Request, Accept, and PS_RDY
 - Dedicated full-height PD analysis page for wire messages and firmware-state traces
-- A grouped settings drawer with compact common sections and collapsed device, recovery, offline, diagnostic, and about sections
+- A compact grouped settings window plus a separate record manager for recovery
+  sessions and device-stored recordings
 - Connect/disconnect control
 
 ### Python Bindings

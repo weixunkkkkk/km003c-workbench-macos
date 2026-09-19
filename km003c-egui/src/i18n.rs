@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 pub(crate) const APP_TITLE: &str = "KM003C 工作台";
 pub(crate) const APP_ID: &str = "com.weixun.km003cworkbench";
 pub(crate) const APP_VERSION: &str = "0.1.0";
-pub(crate) const APP_BUILD: &str = "1";
+pub(crate) const APP_BUILD: &str = "3";
 
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum Language {
@@ -27,13 +27,6 @@ impl Language {
         match self {
             Self::SimplifiedChinese => "简体中文",
             Self::English => "English",
-        }
-    }
-
-    pub(crate) const fn short_name(self) -> &'static str {
-        match self {
-            Self::SimplifiedChinese => "简中",
-            Self::English => "EN",
         }
     }
 }

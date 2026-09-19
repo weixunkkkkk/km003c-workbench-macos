@@ -13,9 +13,9 @@ def validate_tag(tag: str, version: str) -> None:
         raise ValueError(f"Invalid application version: {version!r}")
     if not tag or tag == f"v{version}":
         return
-    match = re.fullmatch(rf"v{re.escape(version)}-(\d{{8}})", tag)
+    match = re.fullmatch(rf"v{re.escape(version)}-(\d{{8}})(?:-(\d+))?", tag)
     if match is None:
-        raise ValueError(f"Tag {tag!r} must be v{version} or v{version}-YYYYMMDD")
+        raise ValueError(f"Tag {tag!r} must be v{version}, v{version}-YYYYMMDD, or v{version}-YYYYMMDD-N")
     datetime.datetime.strptime(match.group(1), "%Y%m%d")
 
 
