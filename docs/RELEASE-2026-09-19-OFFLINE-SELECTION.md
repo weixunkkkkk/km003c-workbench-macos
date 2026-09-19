@@ -24,7 +24,7 @@ App 版本：`0.1.0 (3)`
 ## 验证
 
 - `cargo fmt --all -- --check` 和 `git diff --check` 通过。
-- `cargo test --locked` 通过：GUI 99 项通过、3 项需要设备或外部验收文件的测试忽略；库、集成和文档测试全部通过。
+- `cargo test --locked` 通过：GUI 93 项通过、3 项需要设备或外部验收文件的测试忽略；库、集成和文档测试全部通过。
 - `cargo clippy --workspace --all-targets --locked -- -D warnings` 通过。
 - `Scripts/verify_dmg.sh` 通过：DMG 完整性、`Info.plist`、`arm64 + x86_64` Universal 二进制及 ad-hoc 签名均正常。
 - 当前 DMG SHA-256：

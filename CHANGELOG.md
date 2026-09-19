@@ -44,7 +44,7 @@ the KM003C 23-column recording contract remain compatible.
 
 ### Validation
 
-- `cargo test --locked`: 99 GUI tests passed, 3 hardware/external-artifact
+- `cargo test --locked`: 93 GUI tests passed, 3 hardware/external-artifact
   tests ignored, and all library/integration tests passed.
 - `cargo fmt --all -- --check`, strict Clippy, Universal App, DMG, and ad-hoc
   signature checks passed.

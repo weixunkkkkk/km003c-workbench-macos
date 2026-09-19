@@ -21,7 +21,7 @@
 ## 验证结果
 
 - `cargo fmt --all -- --check`：通过。
-- `cargo test --locked`：全工作区测试与文档测试通过；最后 GUI 小改后补跑 GUI 全部测试：99通过、3个需要指定硬件/外部验收文件的测试保持忽略。
+- `cargo test --locked`：全工作区测试与文档测试通过；最后 GUI 小改后补跑 GUI 全部测试：93通过、3个需要指定硬件/外部验收文件的测试保持忽略。
 - `cargo clippy --locked --all-targets -- -D warnings`：通过。
 - `cargo build --locked -p km003c-egui`：通过。
 - 新增窗口实测布局测试：1024×700、1280×820、1728×1117，简中/English、五类设置，窗口保持在屏幕内。
