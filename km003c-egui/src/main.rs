@@ -5845,34 +5845,34 @@ impl PowerMonitorApp {
                 let content_width = (accumulated_width - 22.0).max(0.0);
                 ui.set_width(content_width);
                 ui.set_max_width(content_width);
-                ui.horizontal(|ui| {
-                    let duration_width = 78.0;
-                    let title_width = (content_width - duration_width - 6.0).max(0.0);
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(title_width, 18.0),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(language.pick("会话累计", "Session totals"))
-                                        .strong()
-                                        .size(14.0),
-                                )
-                                .truncate(),
-                            );
-                        },
-                    );
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(duration_width, 18.0),
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            ui.add(
-                                egui::Label::new(egui::RichText::new(&duration_text).monospace().size(11.0)).truncate(),
-                            )
-                            .on_hover_text(&duration_text);
-                        },
-                    );
-                });
+                let (header, _) = ui.allocate_exact_size(egui::vec2(content_width, 22.0), egui::Sense::hover());
+                let mut title = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(egui::Rect::from_min_max(
+                            header.min,
+                            header.right_bottom() - egui::vec2(84.0, 0.0),
+                        ))
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                );
+                title.add(
+                    egui::Label::new(
+                        egui::RichText::new(language.pick("会话累计", "Session totals"))
+                            .strong()
+                            .size(14.0),
+                    )
+                    .truncate(),
+                );
+                let mut timer = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(egui::Rect::from_min_max(
+                            header.right_top() - egui::vec2(78.0, 0.0),
+                            header.max,
+                        ))
+                        .layout(egui::Layout::right_to_left(egui::Align::Center)),
+                );
+                timer
+                    .add(egui::Label::new(egui::RichText::new(&duration_text).monospace().size(11.0)).truncate())
+                    .on_hover_text(&duration_text);
                 for (label, value, color) in [
                     (
                         language.pick("累计能量", "Energy"),
@@ -5886,25 +5886,7 @@ impl PowerMonitorApp {
                         theme::text_secondary(),
                     ),
                 ] {
-                    ui.horizontal(|ui| {
-                        let label_width = 70.0;
-                        let value_width = (content_width - label_width - 6.0).max(0.0);
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(label_width, 20.0),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                ui.add(egui::Label::new(egui::RichText::new(label).color(color)).truncate());
-                            },
-                        );
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(value_width, 20.0),
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                ui.add(egui::Label::new(egui::RichText::new(value).monospace()).truncate())
-                                    .on_hover_text(value);
-                            },
-                        );
-                    });
+                    accumulated_reading_row(ui, label, value, color);
                 }
             });
 
@@ -6300,6 +6282,37 @@ fn instrument_card(ui: &mut egui::Ui, data: InstrumentCardData<'_>) {
     painter.rect_filled(stripe_rect, 2.0, color);
 }
 
+fn accumulated_reading_row(ui: &mut egui::Ui, label: &str, value: &str, color: egui::Color32) {
+    let (number, unit) = value.rsplit_once(' ').unwrap_or((value, ""));
+    let (direction, number) = number.split_once(' ').unwrap_or(("", number));
+    let width = ui.available_width();
+    let (row, _) = ui.allocate_exact_size(egui::vec2(width, 22.0), egui::Sense::hover());
+    let mut left = row.left();
+    for (text, cell_width, align, cell_color) in [
+        (label, 70.0, egui::Align::Min, color),
+        (direction, 12.0, egui::Align::Center, theme::text_primary()),
+        (
+            number,
+            (width - 122.0).max(0.0),
+            egui::Align::Max,
+            theme::text_primary(),
+        ),
+        (unit, 28.0, egui::Align::Min, theme::text_secondary()),
+    ] {
+        let rect = egui::Rect::from_min_size(egui::pos2(left, row.top()), egui::vec2(cell_width, row.height()));
+        let mut cell = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(match align {
+            egui::Align::Max => egui::Layout::right_to_left(egui::Align::Center),
+            egui::Align::Center => egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+            egui::Align::Min => egui::Layout::left_to_right(egui::Align::Center),
+        }));
+        cell.set_max_width(cell_width);
+        let text = egui::RichText::new(text).color(cell_color).size(12.0);
+        cell.add(egui::Label::new(if text.text() == label { text } else { text.monospace() }).truncate())
+            .on_hover_text(value);
+        left += cell_width + 4.0;
+    }
+}
+
 fn compact_signal_value(ui: &mut egui::Ui, label: &str, value: Option<f64>, width: f32, language: Language) {
     let text = value.map_or_else(|| format!("{label} —"), |value| format!("{label} {value:.2}"));
     let response = ui.allocate_ui_with_layout(
@@ -6344,131 +6357,132 @@ impl PowerMonitorApp {
 
     fn show_ruler_menu(&mut self, ui: &mut egui::Ui) {
         let language = self.language;
-        ui.menu_button(
-            format!("{} ({})", language.pick("标尺", "Rulers"), self.rulers.len()),
-            |ui| {
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(
-                            self.cursor_readout.is_some(),
-                            egui::Button::new(language.pick("添加当前游标", "Add cursor")),
-                        )
-                        .clicked()
-                    {
-                        self.add_ruler(self.cursor_readout);
-                    }
-                    if ui
-                        .add_enabled(
-                            !self.rulers.is_empty(),
-                            egui::Button::new(language.pick("清除标尺", "Clear rulers")),
-                        )
-                        .clicked()
-                    {
-                        self.rulers.clear();
-                    }
-                });
-                ui.horizontal(|ui| {
-                    for (index, label) in ["U", "I", "P", "E", "Q"].into_iter().enumerate() {
-                        ui.checkbox(&mut self.ruler_metrics[index], label).on_hover_text(
-                            [
-                                language.pick("电压", "Voltage"),
-                                language.pick("电流（绝对值）", "Current (absolute)"),
-                                language.pick("功率（绝对值）", "Power (absolute)"),
-                                language.pick("累计能量", "Cumulative energy"),
-                                language.pick("累计容量", "Cumulative capacity"),
-                            ][index],
-                        );
-                    }
-                });
-                let mut remove = None;
-                egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
-                    egui::Grid::new("ruler_readings").spacing([6.0, 6.0]).show(ui, |ui| {
-                        ui.label(language.pick("标尺 / 时间", "Ruler / Time"));
-                        for (index, label) in ["U", "I", "P", "E", "Q"].into_iter().enumerate() {
-                            if self.ruler_metrics[index] {
-                                ui.label(label);
-                            }
-                        }
-                        ui.label("");
-                        ui.end_row();
-                        for (index, readout) in self.rulers.iter().copied().enumerate() {
-                            let time = format!(
-                                "M{} {}{}",
-                                index + 1,
-                                if readout.approximate { "≈" } else { "" },
-                                format_plot_time(readout.time_seconds)
-                            );
-                            if ui
-                                .add_sized(
-                                    [146.0, 24.0],
-                                    egui::Button::new(egui::RichText::new(time).monospace().size(11.0)),
-                                )
-                                .clicked()
-                            {
-                                self.cursor_readout = Some(readout);
-                                self.cursor_pinned = true;
-                            }
-                            let engineering = |value, unit| {
-                                let presentation = EngineeringPresentation::for_value(value, unit);
-                                format!("{} {}", presentation.format_value(value), presentation.symbol)
-                            };
-                            let values = [
-                                engineering(readout.voltage, MeasurementUnit::Voltage),
-                                engineering(readout.current, MeasurementUnit::Current),
-                                engineering(readout.power, MeasurementUnit::Power),
-                                EnergyPresentation::for_values([readout.cumulative_energy_uwh])
-                                    .format(readout.cumulative_energy_uwh),
-                                format_capacity(readout.capacity_uah),
-                            ];
-                            for (metric, value) in values.into_iter().enumerate() {
-                                if self.ruler_metrics[metric] {
-                                    ui.add_sized(
-                                        [82.0, 24.0],
-                                        egui::Label::new(egui::RichText::new(&value).monospace().size(11.0)).truncate(),
-                                    )
-                                    .on_hover_text(value);
-                                }
-                            }
-                            if ui
-                                .small_button("×")
-                                .on_hover_text(language.pick("删除标尺", "Remove ruler"))
-                                .clicked()
-                            {
-                                remove = Some(index);
-                            }
-                            ui.end_row();
-                        }
-                    });
-                });
-                if let Some(index) = remove {
-                    self.rulers.remove(index);
-                }
-                if let (Some(first), Some(last)) = (self.rulers.first(), self.rulers.last())
-                    && self.rulers.len() > 1
+        egui::containers::menu::MenuButton::from_button(
+            egui::Button::new(format!("{} ({})", language.pick("标尺", "Rulers"), self.rulers.len()))
+                .min_size(egui::vec2(88.0, 32.0)),
+        )
+        .ui(ui, |ui| {
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        self.cursor_readout.is_some(),
+                        egui::Button::new(language.pick("添加当前游标", "Add cursor")),
+                    )
+                    .clicked()
                 {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "M{} − M1: Δt {:.3} s · ΔU {:.6} V · ΔI {:.6} A · ΔP {:.6} W",
-                            self.rulers.len(),
-                            last.time_seconds - first.time_seconds,
-                            last.voltage - first.voltage,
-                            last.current - first.current,
-                            last.power - first.power
-                        ))
-                        .monospace()
-                        .size(11.0),
+                    self.add_ruler(self.cursor_readout);
+                }
+                if ui
+                    .add_enabled(
+                        !self.rulers.is_empty(),
+                        egui::Button::new(language.pick("清除标尺", "Clear rulers")),
+                    )
+                    .clicked()
+                {
+                    self.rulers.clear();
+                }
+            });
+            ui.horizontal(|ui| {
+                for (index, label) in ["U", "I", "P", "E", "Q"].into_iter().enumerate() {
+                    ui.checkbox(&mut self.ruler_metrics[index], label).on_hover_text(
+                        [
+                            language.pick("电压", "Voltage"),
+                            language.pick("电流（绝对值）", "Current (absolute)"),
+                            language.pick("功率（绝对值）", "Power (absolute)"),
+                            language.pick("累计能量", "Cumulative energy"),
+                            language.pick("累计容量", "Cumulative capacity"),
+                        ][index],
                     );
                 }
+            });
+            let mut remove = None;
+            egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+                egui::Grid::new("ruler_readings").spacing([6.0, 6.0]).show(ui, |ui| {
+                    ui.label(language.pick("标尺 / 时间", "Ruler / Time"));
+                    for (index, label) in ["U", "I", "P", "E", "Q"].into_iter().enumerate() {
+                        if self.ruler_metrics[index] {
+                            ui.label(label);
+                        }
+                    }
+                    ui.label("");
+                    ui.end_row();
+                    for (index, readout) in self.rulers.iter().copied().enumerate() {
+                        let time = format!(
+                            "M{} {}{}",
+                            index + 1,
+                            if readout.approximate { "≈" } else { "" },
+                            format_plot_time(readout.time_seconds)
+                        );
+                        if ui
+                            .add_sized(
+                                [146.0, 24.0],
+                                egui::Button::new(egui::RichText::new(time).monospace().size(11.0)),
+                            )
+                            .clicked()
+                        {
+                            self.cursor_readout = Some(readout);
+                            self.cursor_pinned = true;
+                        }
+                        let engineering = |value, unit| {
+                            let presentation = EngineeringPresentation::for_value(value, unit);
+                            format!("{} {}", presentation.format_value(value), presentation.symbol)
+                        };
+                        let values = [
+                            engineering(readout.voltage, MeasurementUnit::Voltage),
+                            engineering(readout.current, MeasurementUnit::Current),
+                            engineering(readout.power, MeasurementUnit::Power),
+                            EnergyPresentation::for_values([readout.cumulative_energy_uwh])
+                                .format(readout.cumulative_energy_uwh),
+                            format_capacity(readout.capacity_uah),
+                        ];
+                        for (metric, value) in values.into_iter().enumerate() {
+                            if self.ruler_metrics[metric] {
+                                ui.add_sized(
+                                    [82.0, 24.0],
+                                    egui::Label::new(egui::RichText::new(&value).monospace().size(11.0)).truncate(),
+                                )
+                                .on_hover_text(value);
+                            }
+                        }
+                        if ui
+                            .small_button("×")
+                            .on_hover_text(language.pick("删除标尺", "Remove ruler"))
+                            .clicked()
+                        {
+                            remove = Some(index);
+                        }
+                        ui.end_row();
+                    }
+                });
+            });
+            if let Some(index) = remove {
+                self.rulers.remove(index);
+            }
+            if let (Some(first), Some(last)) = (self.rulers.first(), self.rulers.last())
+                && self.rulers.len() > 1
+            {
                 ui.label(
-                    egui::RichText::new(language.pick(
-                        "右键曲线可添加；点击标尺可固定读数。≈ 表示历史概览约值。",
-                        "Right-click a trace to add; click a ruler to pin readings. ≈ means aggregated history.",
+                    egui::RichText::new(format!(
+                        "M{} − M1: Δt {:.3} s · ΔU {:.6} V · ΔI {:.6} A · ΔP {:.6} W",
+                        self.rulers.len(),
+                        last.time_seconds - first.time_seconds,
+                        last.voltage - first.voltage,
+                        last.current - first.current,
+                        last.power - first.power
                     ))
-                    .small()
-                    .color(theme::text_secondary()),
+                    .monospace()
+                    .size(11.0),
                 );
-            },
-        );
+            }
+            ui.label(
+                egui::RichText::new(language.pick(
+                    "右键曲线可添加；点击标尺可固定读数。≈ 表示历史概览约值。",
+                    "Right-click a trace to add; click a ruler to pin readings. ≈ means aggregated history.",
+                ))
+                .small()
+                .color(theme::text_secondary()),
+            );
+        });
     }
 
     fn draw_rulers(&self, plot_ui: &mut egui_plot::PlotUi<'_>) {
@@ -6596,6 +6610,8 @@ impl PowerMonitorApp {
 
     fn show_chart_follow_controls(&mut self, ui: &mut egui::Ui, compact: bool) {
         let language = self.language;
+        ui.spacing_mut().interact_size.y = 32.0;
+        ui.spacing_mut().item_spacing.x = 8.0;
         let pin_label = if self.cursor_pinned {
             if compact {
                 language.pick("取消固定", "Unpin")
@@ -6610,7 +6626,7 @@ impl PowerMonitorApp {
         if ui
             .add_enabled_ui(self.cursor_readout.is_some(), |ui| {
                 ui.add_sized(
-                    [if compact { 80.0 } else { 104.0 }, 28.0],
+                    [if compact { 80.0 } else { 104.0 }, 32.0],
                     egui::Button::new(pin_label).selected(self.cursor_pinned),
                 )
             })
@@ -6629,8 +6645,12 @@ impl PowerMonitorApp {
             ),
             ChartFollowMode::Manual => language.pick("手动窗口", "Manual window").to_string(),
         };
+        ui.allocate_ui_with_layout(
+            egui::vec2(132.0, 32.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
         egui::ComboBox::from_id_salt("monitor_range_mode")
-            .width(if compact { 96.0 } else { 132.0 })
+                    .width(132.0)
             .truncate()
             .selected_text(&range_label)
             .show_ui(ui, |ui| {
@@ -6661,6 +6681,8 @@ impl PowerMonitorApp {
                 "全程会从 00:00:00.0 展开；最近窗口会保持指定宽度；拖动或缩放后进入手动窗口",
                 "Full session grows from 00:00:00.0. Latest keeps a fixed-width window. Drag or zoom to enter manual view.",
             )));
+            },
+        );
         if self.chart_follow_mode == ChartFollowMode::Manual
             && ui
                 .button(if compact {
@@ -8380,7 +8402,8 @@ impl PowerMonitorApp {
                         SETTINGS_FORM_ROW_HEIGHT,
                         |control| {
                             egui::ComboBox::from_id_salt("settings_language")
-                                .width(form.control_width)
+                                .width(form.control_width.min(180.0))
+                                .truncate()
                                 .selected_text(self.language.native_name())
                                 .show_ui(control, |control| {
                                     for option in Language::ALL {
@@ -9822,6 +9845,50 @@ mod tests {
         assert_eq!(app.plot_source, PlotSource::Live);
         assert_eq!(app.recording_phase, RecordingPhase::Paused);
         assert_eq!(app.total_samples, 100);
+    }
+
+    #[test]
+    fn accumulated_readings_align_numbers_and_units_without_direction_drift() {
+        let ctx = egui::Context::default();
+        for width in [180.0, 218.0] {
+            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui.set_width(width);
+                for (label, value) in [
+                    ("Energy", "13.3686 Wh"),
+                    ("Capacity", "682.851 mAh"),
+                    ("Net energy", "↓ 13.3686 Wh"),
+                    ("Unknown", "—"),
+                ] {
+                    accumulated_reading_row(ui, label, value, theme::text_primary());
+                }
+            });
+            let texts = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let number_edges = texts
+                .iter()
+                .filter(|text| matches!(text.galley.job.text.as_str(), "13.3686" | "682.851" | "—"))
+                .map(|text| text.pos.x + text.galley.rect.right())
+                .collect::<Vec<_>>();
+            let unit_edges = texts
+                .iter()
+                .filter(|text| matches!(text.galley.job.text.as_str(), "Wh" | "mAh"))
+                .map(|text| text.pos.x + text.galley.rect.left())
+                .collect::<Vec<_>>();
+            assert_eq!(number_edges.len(), 4);
+            assert_eq!(unit_edges.len(), 3);
+            assert!(
+                number_edges.iter().all(|edge| (edge - number_edges[0]).abs() < 0.01),
+                "{number_edges:?}"
+            );
+            assert!(unit_edges.iter().all(|edge| (edge - unit_edges[0]).abs() < 0.01));
+            assert!(unit_edges[0] > number_edges[0]);
+        }
     }
 
     #[test]
