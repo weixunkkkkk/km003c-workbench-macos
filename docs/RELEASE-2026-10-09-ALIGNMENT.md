@@ -1,6 +1,6 @@
 # KM003C 工作台 v0.1.0 (7) 对齐修订包
 
-日期：2026-10-09。本轮按用户确认的三处对齐建议修改并重新打包；随后按用户“安装”指令完成本地 build 7 安装。没有发布 GitHub Release。
+日期：2026-10-09。本轮按用户确认的三处对齐建议修改并重新打包；随后按用户“安装”指令完成本地 build 7 安装，并按明确确认公开发布 GitHub Release。
 
 ## 改动
 
@@ -43,3 +43,12 @@
 - 已安装包与交付 App 的逐文件比较、严格 ad-hoc 签名、arm64 / x86_64 架构和二进制 SHA-256 均通过，二进制哈希与上方 build 7 一致。
 - 正式安装版实际导入上述 CSV，显示 365,092 点、01:11:03.0、45.9379 Wh / 2.3320 Ah。当前大窗口截图确认范围、标尺、固定游标三控件顶底对齐，累计量数字右边界和单位列一致；设置可以打开与正常关闭。
 - 应用保留已导入文件的查看状态，便于用户直接复查。此次没有启动真机录制，也没有重跑完整中英文、尺寸与皮肤截图矩阵。
+
+## GitHub 公开发布
+
+- 发布：[v0.1.0-20261009](https://github.com/weixunkkkkk/km003c-workbench-macos/releases/tag/v0.1.0-20261009)，App `0.1.0 (7)`；非草稿、非预发布，设为 Latest，旧版发布保留。
+- 标签对应 `2878248fc1d060a1e9a8a2d63c72cf7c7ddec3a6`。该提交相对已打包源码只有新增回归测试和发布文档，生产逻辑没有变化。
+- [CI 37893952361](https://github.com/weixunkkkkk/km003c-workbench-macos/actions/runs/37893952361) 全部通过：格式、完整测试、全特性测试、严格 Clippy、文档、打包、Rust 1.97、macOS / Windows 与 Python。
+- [Release 37894054899](https://github.com/weixunkkkkk/km003c-workbench-macos/actions/runs/37894054899) 全部通过：版本规则、Linux / Windows / macOS Universal 构建与草稿生成。
+- 公开前将 CI 生成的 macOS 镜像替换为本地已安装的原 build 7 DMG，远端资产 SHA-256 与上方交付哈希一致；同步更新 `SHA256SUMS` 并上传同名 `.dmg.sha256`。Linux 与 Windows 资产保留。
+- 上传范围仅源码、说明、二进制和校验文件，不包含原始 CSV、用户偏好或恢复数据；不关闭 Issue #9，不宣称真机或原 Intel 退出崩溃已验证。

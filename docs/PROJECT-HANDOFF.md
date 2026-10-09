@@ -1,6 +1,6 @@
 # KM003C 工作台移交文档
 
-更新日期：2026-10-09。最新本地安装为 App `0.1.0 (7)`，包含已合并 PR #15、Issue #9 剩余修复和界面对齐修订。整合基线见 [build 6 交付记录](RELEASE-2026-10-09-ISSUE9-PR15.md)。最近公开发布标签仍为 `v0.1.0-20261004`（App `0.1.0 (5)`）；本轮未发布新标签。下方旧记录保留为历史追溯。
+更新日期：2026-10-09。最新本地安装为 App `0.1.0 (7)`，包含已合并 PR #15、Issue #9 剩余修复和界面对齐修订。整合基线见 [build 6 交付记录](RELEASE-2026-10-09-ISSUE9-PR15.md)。最新公开发布为 [v0.1.0-20261009](https://github.com/weixunkkkkk/km003c-workbench-macos/releases/tag/v0.1.0-20261009)（App `0.1.0 (7)`），CI 与发布构建均通过，原 build 5 发布保留。下方旧记录保留为历史追溯。
 
 同日已正式安装 App `0.1.0 (7)`，逐文件比较、签名和架构检查通过；关于页确认版本，实际导入 365,092 点 CSV 后对齐检查通过，见 [构建与安装验收记录](RELEASE-2026-10-09-ALIGNMENT.md)。旧 build 6 完整备份保留在 `release/rollback/alignment-20261009-build6/`。
 
@@ -19,7 +19,7 @@
 | 工作分支 | `macos-workbench`，跟踪 `github/main` |
 | 用户远程 | `github` |
 | 上游远程 | `origin` → `okhsunrog/km003c-rs` |
-| App 版本 | 本地 `0.1.0 (7)`；公开发布 `0.1.0 (5)` |
+| App 版本 | 本地与公开发布均为 `0.1.0 (7)` |
 | Cargo workspace 版本 | `0.3.0`，与 App 版本不同 |
 | Bundle ID | `com.weixun.km003cworkbench` |
 | 系统与架构 | macOS 11+，arm64 / x86_64 Universal |
