@@ -1,10 +1,11 @@
 use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread::{self, JoinHandle};
 
-use polars::prelude::{CsvReader, DataFrame, DataType, ParquetReader, SerReader};
+use polars::prelude::{CsvReadOptions, CsvReader, DataFrame, DataType, ParquetReader, SerReader};
 
 use crate::measurement::MeasurementSample;
 use crate::recording_session::{PARQUET_SESSION_METADATA_KEY, RecordingSessionMetadataV1, read_sidecar};
@@ -40,6 +41,7 @@ pub(crate) struct ImportedRecording {
     pub(crate) path: PathBuf,
     pub(crate) samples: Arc<Vec<MeasurementSample>>,
     pub(crate) metadata: Option<RecordingSessionMetadataV1>,
+    pub(crate) derived_accumulators: bool,
 }
 
 #[derive(Debug)]
@@ -108,14 +110,33 @@ pub(crate) fn load_recording(path: &Path) -> Result<ImportedRecording, String> {
         .ok_or_else(|| "文件没有扩展名，只支持 .csv 和 .parquet".to_string())?;
     let metadata = read_sidecar(path)?;
     let frame = match extension.as_str() {
-        "csv" => CsvReader::new(File::open(path).map_err(display_error)?),
+        "csv" => {
+            let header = BufReader::new(File::open(path).map_err(display_error)?)
+                .lines()
+                .take(64)
+                .enumerate()
+                .find_map(|(line, text)| {
+                    text.ok()
+                        .filter(|text| {
+                            text.trim_start_matches('\u{feff}')
+                                .starts_with("Time(D.hh:mm:ss.ms),Voltage(V),Current(A),Power(W),")
+                        })
+                        .map(|_| line)
+                });
+            let frame = CsvReader::new(File::open(path).map_err(display_error)?)
+                .with_options(CsvReadOptions::default().with_skip_lines(header.unwrap_or(0)))
+                .finish()
+                .map_err(|error| format!("CSV 读取失败：{error}"))?;
+            if header.is_some() {
+                return engineering_dataframe_to_recording(path, frame);
+            }
+            frame
+        }
         "parquet" => {
             return load_parquet(path, metadata);
         }
         _ => return Err("文件格式不支持，只能导入 KM003C CSV 或 Parquet".to_string()),
-    }
-    .finish()
-    .map_err(|error| format!("CSV 读取失败：{error}"))?;
+    };
     dataframe_to_recording(path, frame, metadata)
 }
 
@@ -228,6 +249,93 @@ fn dataframe_to_recording(
         path: path.to_path_buf(),
         samples: Arc::new(samples),
         metadata,
+        derived_accumulators: false,
+    })
+}
+
+fn engineering_dataframe_to_recording(path: &Path, frame: DataFrame) -> Result<ImportedRecording, String> {
+    if frame.height() == 0 {
+        return Err("CSV 没有采样点 / CSV contains no samples".to_string());
+    }
+    let times = required_f64(&frame, "RelativeTime(s)")?;
+    let voltage = required_f64(&frame, "Voltage(V)")?;
+    let current = required_f64(&frame, "Current(A)")?;
+    let power = required_f64(&frame, "Power(W)")?;
+    let signals = ["CC1(V)", "CC2(V)", "D+(V)", "D-(V)"]
+        .map(|name| required_f64(&frame, name))
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    let segments = required_u64(&frame, "RecordingSegment")?;
+    let intervals = required_f64(&frame, "SampleInterval(ms)")?;
+    let mut samples: Vec<MeasurementSample> = Vec::with_capacity(frame.height());
+    let mut accumulators = [0.0; 4];
+    for row in 0..frame.height() {
+        if !times[row].is_finite() || times[row] < 0.0 || times[row] * 1e6 >= u64::MAX as f64 {
+            return Err(format!("Invalid RelativeTime(s), row {}", row + 1));
+        }
+        let elapsed_us = (times[row] * 1e6).round() as u64;
+        let to_micro = |value: f64| -> Result<i64, String> {
+            let micro = value * 1e6;
+            if !micro.is_finite() || micro <= i64::MIN as f64 || micro >= i64::MAX as f64 {
+                return Err(format!("Invalid engineering value, row {}", row + 1));
+            }
+            Ok(micro.round() as i64)
+        };
+        let ibus_ua = to_micro(current[row])?;
+        let power_uw = to_micro(power[row])?;
+        let mut gap_duration_us = 0;
+        if let Some(previous) = samples.last() {
+            if elapsed_us < previous.elapsed_us {
+                return Err(format!("时间字段乱序 / Time is out of order, row {}", row + 1));
+            }
+            let delta_us = elapsed_us - previous.elapsed_us;
+            let expected_us = intervals[row].max(intervals[row - 1]) * 1000.0;
+            if segments[row] == segments[row - 1] && delta_us as f64 <= expected_us * 3.0 {
+                // External files have no device accumulators; never integrate a pause between segments.
+                let factor = delta_us as f64 / 7_200_000_000.0;
+                accumulators[0] += (previous.ibus_ua as f64 + ibus_ua as f64) * factor;
+                accumulators[1] += (previous.power_uw as f64 + power_uw as f64) * factor;
+                accumulators[2] += (previous.ibus_ua.unsigned_abs() as f64 + ibus_ua.unsigned_abs() as f64) * factor;
+                accumulators[3] += (previous.power_uw.unsigned_abs() as f64 + power_uw.unsigned_abs() as f64) * factor;
+            } else {
+                gap_duration_us = delta_us;
+            }
+        }
+        let interval = intervals[row];
+        if !interval.is_finite() || interval <= 0.0 || 1000.0 / interval > f64::from(u16::MAX) {
+            return Err(format!("Invalid SampleInterval(ms), row {}", row + 1));
+        }
+        samples.push(MeasurementSample {
+            elapsed_us,
+            sample_index: row as u64,
+            sequence: 0,
+            marker: 0,
+            sample_rate_hz: (1000.0 / interval).round() as u16,
+            missing_samples: 0,
+            gap_duration_us,
+            interpolated: false,
+            cumulative_missing_samples: 0,
+            cumulative_interpolated_duration_us: 0,
+            discarded_sequence_samples: 0,
+            cumulative_discarded_sequence_samples: 0,
+            vbus_uv: to_micro(voltage[row])?,
+            ibus_ua,
+            power_uw,
+            charge_uah: accumulators[0],
+            energy_uwh: accumulators[1],
+            charge_throughput_uah: accumulators[2],
+            energy_throughput_uwh: accumulators[3],
+            cc1_uv: to_micro(signals[0][row])?,
+            cc2_uv: to_micro(signals[1][row])?,
+            dp_uv: to_micro(signals[2][row])?,
+            dm_uv: to_micro(signals[3][row])?,
+        });
+    }
+    Ok(ImportedRecording {
+        path: path.to_owned(),
+        samples: Arc::new(samples),
+        metadata: None,
+        derived_accumulators: true,
     })
 }
 
@@ -308,7 +416,7 @@ fn optional_bool(frame: &DataFrame, name: &str) -> Result<Vec<bool>, String> {
 fn cast_column(frame: &DataFrame, name: &str, data_type: DataType) -> Result<polars::prelude::Column, String> {
     frame
         .column(name)
-        .map_err(|_| format!("缺少 KM003C 字段：{name}"))?
+        .map_err(|_| format!("缺少字段 / Missing column: {name}"))?
         .cast(&data_type)
         .map_err(|error| format!("字段 {name} 无法转换为 {data_type:?}：{error}"))
 }
@@ -375,6 +483,72 @@ mod tests {
         assert_eq!(imported.samples[1].elapsed_us, 20_000);
         assert_eq!(imported.samples[1].power_uw, 18_000_000);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn imports_engineering_csv_without_integrating_between_segments() {
+        let imported = load_recording(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/engineering.csv"
+        )))
+        .unwrap();
+        assert_eq!(imported.samples.len(), 3);
+        assert_eq!(imported.samples[0].vbus_uv, 9_000_001);
+        assert_eq!(imported.samples[1].ibus_ua, -1_000_000);
+        assert_eq!(imported.samples[2].elapsed_us, 2_000_000);
+        assert_eq!(imported.samples[0].cc1_uv, 305_800);
+        assert_eq!(imported.samples[1].charge_uah, 0.0);
+        assert!((imported.samples[1].charge_throughput_uah - 1e6 / 3600.0).abs() < 0.001);
+        assert_eq!(imported.samples[1].energy_throughput_uwh, 2500.0);
+        assert_eq!(imported.samples[2].energy_throughput_uwh, 2500.0);
+        assert!(imported.metadata.is_none());
+        assert!(imported.derived_accumulators);
+    }
+
+    #[test]
+    fn rejects_invalid_engineering_values_and_does_not_bridge_unknown_gaps() {
+        let fixture = include_str!("../tests/fixtures/engineering.csv");
+        for (from, to) in [
+            ("9.000001", "NaN"),
+            (",1,1791277606000,", ",-1,1791277606000,"),
+            (",1,1000,", ",1,0,"),
+        ] {
+            let path = test_path();
+            std::fs::write(&path, fixture.replace(from, to)).unwrap();
+            assert!(load_recording(&path).is_err(), "{from} -> {to}");
+            std::fs::remove_file(path).unwrap();
+        }
+        let path = test_path();
+        std::fs::write(
+            &path,
+            fixture
+                .replace(",1,1791277606000,", ",10,1791277606000,")
+                .replace(",2,1791277607000,", ",11,1791277607000,"),
+        )
+        .unwrap();
+        let imported = load_recording(&path).unwrap();
+        assert_eq!(imported.samples[1].gap_duration_us, 10_000_000);
+        assert_eq!(imported.samples[2].energy_throughput_uwh, 0.0);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires the supplied external CSV, set KM003C_CSV_FIXTURE"]
+    fn imports_supplied_full_csv() {
+        let path = PathBuf::from(std::env::var_os("KM003C_CSV_FIXTURE").expect("KM003C_CSV_FIXTURE required"));
+        let recording = load_recording(&path).unwrap();
+        assert_eq!(recording.samples.len(), 365_092);
+        assert_eq!(recording.samples[0].elapsed_us, 9_467);
+        assert_eq!(recording.samples[0].vbus_uv, 19_711_632);
+        assert_eq!(recording.samples.last().unwrap().elapsed_us, 4_263_039_858);
+        assert!(recording.derived_accumulators);
+        println!(
+            "rows={} final_s={} energy_uwh={} capacity_uah={}",
+            recording.samples.len(),
+            recording.samples.last().unwrap().elapsed_seconds(),
+            recording.samples.last().unwrap().energy_throughput_uwh,
+            recording.samples.last().unwrap().charge_throughput_uah
+        );
     }
 
     #[test]

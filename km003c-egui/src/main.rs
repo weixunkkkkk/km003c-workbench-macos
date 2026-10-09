@@ -1588,6 +1588,9 @@ struct PowerMonitorApp {
     cursor_readout: Option<CursorReadout>,
     /// Keeps the last cursor table visible while the time viewport moves.
     cursor_pinned: bool,
+    instrument_rail_collapsed: bool,
+    rulers: Vec<CursorReadout>,
+    ruler_metrics: [bool; 5],
     /// Reset all linked plot bounds on the next frame after the user asks to
     /// return to the live window or changes the plotted source/window.
     reset_plots_requested: bool,
@@ -1782,6 +1785,9 @@ impl PowerMonitorApp {
             plot_source: PlotSource::Live,
             cursor_readout: None,
             cursor_pinned: false,
+            instrument_rail_collapsed: false,
+            rulers: Vec::new(),
+            ruler_metrics: [true, true, true, false, false],
             reset_plots_requested: false,
             pd_decoder: PdDecoder::new(),
             pd_log: VecDeque::new(),
@@ -2116,6 +2122,7 @@ impl PowerMonitorApp {
                     self.plot_source = PlotSource::Offline;
                     self.time_window = TimeWindow::All;
                     self.record_manager = None;
+                    self.rulers.clear();
                     self.cursor_readout = None;
                     self.cursor_pinned = false;
                     self.reset_plots_requested = true;
@@ -2134,6 +2141,7 @@ impl PowerMonitorApp {
                     self.offline_device_metadata = None;
                     if self.plot_source == PlotSource::Offline {
                         self.plot_source = PlotSource::Live;
+                        self.rulers.clear();
                         self.cursor_readout = None;
                         self.cursor_pinned = false;
                         self.reset_plots_requested = true;
@@ -3076,6 +3084,7 @@ impl PowerMonitorApp {
         self.data_points.clear();
         self.recording_plot_values.clear();
         self.navigator_history.clear();
+        self.rulers.clear();
         self.cursor_readout = None;
         self.cursor_pinned = false;
         self.reset_plots_requested = true;
@@ -3288,6 +3297,7 @@ impl PowerMonitorApp {
         self.chart_follow_mode = ChartFollowMode::FullSession;
         self.chart_viewport.selection = None;
         self.chart_viewport.drag = None;
+        self.rulers.clear();
         self.cursor_readout = None;
         self.cursor_pinned = false;
         self.reset_plots_requested = true;
@@ -3350,6 +3360,7 @@ impl PowerMonitorApp {
     }
 
     fn close_imported_recording(&mut self) {
+        self.rulers.clear();
         self.imported_recording = None;
         if self.plot_source == PlotSource::Imported {
             self.plot_source = PlotSource::Live;
@@ -3686,6 +3697,7 @@ impl PowerMonitorApp {
     }
 
     fn return_to_live(&mut self) {
+        self.rulers.clear();
         if self.plot_source == PlotSource::Imported {
             self.close_imported_recording();
         } else {
@@ -4225,6 +4237,7 @@ impl PowerMonitorApp {
                 let path = recording.path.clone();
                 self.imported_recording = Some(recording);
                 self.plot_source = PlotSource::Imported;
+                self.rulers.clear();
                 self.record_manager = None;
                 self.active_tab = WorkspaceTab::Monitor;
                 self.time_window = TimeWindow::All;
@@ -4938,6 +4951,22 @@ impl PowerMonitorApp {
                         }
                     }
 
+                    if self.active_tab == WorkspaceTab::Monitor
+                        && ui
+                            .add_sized(
+                                [30.0, 30.0],
+                                egui::Button::new(if self.instrument_rail_collapsed { "▶" } else { "◀" }),
+                            )
+                            .on_hover_text(if self.instrument_rail_collapsed {
+                                language.pick("展开仪表栏", "Expand instruments")
+                            } else {
+                                language.pick("折叠仪表栏", "Collapse instruments")
+                            })
+                            .clicked()
+                    {
+                        self.instrument_rail_collapsed = !self.instrument_rail_collapsed;
+                    }
+
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // The right cluster has fixed control heights and stable
                         // widths in both locales.  Keeping the language switch
@@ -5485,16 +5514,18 @@ impl PowerMonitorApp {
         // prevents English labels from changing the chart origin and makes
         // screenshots and cursor alignment comparable in both languages.
         let rail_width = if compact { 224.0 } else { 240.0 };
-        egui::Panel::left("instrument_rail")
-            .resizable(false)
-            .exact_size(rail_width)
-            .frame(
-                egui::Frame::NONE
-                    .fill(theme::backplane())
-                    .stroke(egui::Stroke::new(1.0, theme::divider()))
-                    .inner_margin(egui::Margin::symmetric(10, 10)),
-            )
-            .show(ui, |ui| self.show_instrument_rail(ui, compact));
+        if !self.instrument_rail_collapsed {
+            egui::Panel::left("instrument_rail")
+                .resizable(false)
+                .exact_size(rail_width)
+                .frame(
+                    egui::Frame::NONE
+                        .fill(theme::backplane())
+                        .stroke(egui::Stroke::new(1.0, theme::divider()))
+                        .inner_margin(egui::Margin::symmetric(10, 10)),
+                )
+                .show(ui, |ui| self.show_instrument_rail(ui, compact));
+        }
 
         egui::CentralPanel::default()
             .frame(
@@ -6317,12 +6348,177 @@ fn compact_signal_value(ui: &mut egui::Ui, label: &str, value: Option<f64>, widt
 }
 
 impl PowerMonitorApp {
+    fn add_ruler(&mut self, readout: Option<CursorReadout>) {
+        if let Some(readout) = readout
+            && !self
+                .rulers
+                .iter()
+                .any(|ruler| ruler.time_seconds == readout.time_seconds)
+        {
+            self.rulers.push(readout);
+        }
+    }
+
+    fn show_ruler_menu(&mut self, ui: &mut egui::Ui) {
+        let language = self.language;
+        ui.menu_button(
+            format!("{} ({})", language.pick("标尺", "Rulers"), self.rulers.len()),
+            |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            self.cursor_readout.is_some(),
+                            egui::Button::new(language.pick("添加当前游标", "Add cursor")),
+                        )
+                        .clicked()
+                    {
+                        self.add_ruler(self.cursor_readout);
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.rulers.is_empty(),
+                            egui::Button::new(language.pick("清除标尺", "Clear rulers")),
+                        )
+                        .clicked()
+                    {
+                        self.rulers.clear();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    for (index, label) in ["U", "I", "P", "E", "Q"].into_iter().enumerate() {
+                        ui.checkbox(&mut self.ruler_metrics[index], label).on_hover_text(
+                            [
+                                language.pick("电压", "Voltage"),
+                                language.pick("电流（绝对值）", "Current (absolute)"),
+                                language.pick("功率（绝对值）", "Power (absolute)"),
+                                language.pick("累计能量", "Cumulative energy"),
+                                language.pick("累计容量", "Cumulative capacity"),
+                            ][index],
+                        );
+                    }
+                });
+                let mut remove = None;
+                egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+                    egui::Grid::new("ruler_readings").spacing([6.0, 6.0]).show(ui, |ui| {
+                        ui.label(language.pick("标尺 / 时间", "Ruler / Time"));
+                        for (index, label) in ["U", "I", "P", "E", "Q"].into_iter().enumerate() {
+                            if self.ruler_metrics[index] {
+                                ui.label(label);
+                            }
+                        }
+                        ui.label("");
+                        ui.end_row();
+                        for (index, readout) in self.rulers.iter().copied().enumerate() {
+                            let time = format!(
+                                "M{} {}{}",
+                                index + 1,
+                                if readout.approximate { "≈" } else { "" },
+                                format_plot_time(readout.time_seconds)
+                            );
+                            if ui
+                                .add_sized(
+                                    [146.0, 24.0],
+                                    egui::Button::new(egui::RichText::new(time).monospace().size(11.0)),
+                                )
+                                .clicked()
+                            {
+                                self.cursor_readout = Some(readout);
+                                self.cursor_pinned = true;
+                            }
+                            let engineering = |value, unit| {
+                                let presentation = EngineeringPresentation::for_value(value, unit);
+                                format!("{} {}", presentation.format_value(value), presentation.symbol)
+                            };
+                            let values = [
+                                engineering(readout.voltage, MeasurementUnit::Voltage),
+                                engineering(readout.current, MeasurementUnit::Current),
+                                engineering(readout.power, MeasurementUnit::Power),
+                                EnergyPresentation::for_values([readout.cumulative_energy_uwh])
+                                    .format(readout.cumulative_energy_uwh),
+                                format_capacity(readout.capacity_uah),
+                            ];
+                            for (metric, value) in values.into_iter().enumerate() {
+                                if self.ruler_metrics[metric] {
+                                    ui.add_sized(
+                                        [82.0, 24.0],
+                                        egui::Label::new(egui::RichText::new(&value).monospace().size(11.0)).truncate(),
+                                    )
+                                    .on_hover_text(value);
+                                }
+                            }
+                            if ui
+                                .small_button("×")
+                                .on_hover_text(language.pick("删除标尺", "Remove ruler"))
+                                .clicked()
+                            {
+                                remove = Some(index);
+                            }
+                            ui.end_row();
+                        }
+                    });
+                });
+                if let Some(index) = remove {
+                    self.rulers.remove(index);
+                }
+                if let (Some(first), Some(last)) = (self.rulers.first(), self.rulers.last())
+                    && self.rulers.len() > 1
+                {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "M{} − M1: Δt {:.3} s · ΔU {:.6} V · ΔI {:.6} A · ΔP {:.6} W",
+                            self.rulers.len(),
+                            last.time_seconds - first.time_seconds,
+                            last.voltage - first.voltage,
+                            last.current - first.current,
+                            last.power - first.power
+                        ))
+                        .monospace()
+                        .size(11.0),
+                    );
+                }
+                ui.label(
+                    egui::RichText::new(language.pick(
+                        "右键曲线可添加；点击标尺可固定读数。≈ 表示历史概览约值。",
+                        "Right-click a trace to add; click a ruler to pin readings. ≈ means aggregated history.",
+                    ))
+                    .small()
+                    .color(theme::text_secondary()),
+                );
+            },
+        );
+    }
+
+    fn draw_rulers(&self, plot_ui: &mut egui_plot::PlotUi<'_>) {
+        for (index, ruler) in self.rulers.iter().enumerate() {
+            plot_ui.vline(
+                VLine::new(format!("M{}", index + 1), ruler.time_seconds)
+                    .color(theme::text_secondary())
+                    .width(1.0)
+                    .style(LineStyle::dashed_loose()),
+            );
+        }
+    }
+
     fn show_imported_recording_banner(&mut self, ui: &mut egui::Ui, _compact: bool) {
         if self.plot_source == PlotSource::Live {
             return;
         }
         let language = self.language;
-        let title = format!("{} · {} pts", self.source_label(), self.source_sample_count());
+        let title = format!(
+            "{} · {} pts{}",
+            self.source_label(),
+            self.source_sample_count(),
+            if self.plot_source == PlotSource::Imported
+                && self
+                    .imported_recording
+                    .as_ref()
+                    .is_some_and(|recording| recording.derived_accumulators)
+            {
+                language.pick(" · CSV 积分量", " · Derived totals")
+            } else {
+                ""
+            }
+        );
         let detail = self
             .imported_recording
             .as_ref()
@@ -6349,6 +6545,22 @@ impl PowerMonitorApp {
                     )
                     .to_string()
             });
+        let detail = if self
+            .imported_recording
+            .as_ref()
+            .is_some_and(|recording| recording.derived_accumulators)
+            && self.plot_source == PlotSource::Imported
+        {
+            format!(
+                "{detail} · {}",
+                language.pick(
+                    "容量/能量为 CSV 时间积分值，非设备累计量",
+                    "Capacity/energy are integrated from CSV time, not device accumulators"
+                )
+            )
+        } else {
+            detail
+        };
         let width = ui.available_width();
         let mut close = false;
         egui::Frame::NONE
@@ -6404,6 +6616,7 @@ impl PowerMonitorApp {
         {
             self.cursor_pinned = !self.cursor_pinned;
         }
+        self.show_ruler_menu(ui);
         let range_label = match self.chart_follow_mode {
             ChartFollowMode::FullSession => language.pick("全程", "Full session").to_string(),
             ChartFollowMode::LatestWindow => format!(
@@ -7033,6 +7246,7 @@ impl PowerMonitorApp {
                                 .color([theme::VOLTAGE, theme::CURRENT, theme::POWER][channel])
                                 .radius(2.0));
                         }
+                        self.draw_rulers(plot_ui);
                         let readout = if let Some(readout) = pinned_cursor {
                             readout
                         } else {
@@ -7129,6 +7343,10 @@ impl PowerMonitorApp {
                     // historical interval.
                     self.cursor_readout = None;
                 }
+                if plot_response.response.secondary_clicked()
+                    && let Some(position) = plot_response.response.interact_pointer_pos() {
+                    self.add_ruler(self.cursor_readout_at(plot_response.transform.value_from_position(position).x));
+                }
 
                 if cumulative_track_visible {
                     let mut cumulative_axes = Vec::with_capacity(2);
@@ -7222,6 +7440,7 @@ impl PowerMonitorApp {
                                 );
                             }
                             let readout = cumulative_cursor.or(self.cursor_readout);
+                            self.draw_rulers(plot_ui);
                             if let Some(readout) = readout {
                                 plot_ui.vline(
                                     VLine::new(language.pick("联动游标", "Linked cursor"), readout.time_seconds)
@@ -7270,6 +7489,10 @@ impl PowerMonitorApp {
                         )
                     {
                         self.cursor_readout = Some(readout);
+                    }
+                    if cumulative_plot_response.response.secondary_clicked()
+                        && let Some(position) = cumulative_plot_response.response.interact_pointer_pos() {
+                        self.add_ruler(self.cursor_readout_at(cumulative_plot_response.transform.value_from_position(position).x));
                     }
                 }
 
@@ -8831,6 +9054,7 @@ impl PowerMonitorApp {
                 {
                     self.plot_source = PlotSource::Offline;
                     self.active_tab = WorkspaceTab::Monitor;
+                    self.rulers.clear();
                     self.chart_viewport.selection = None;
                     self.cursor_readout = None;
                     self.cursor_pinned = false;
@@ -9127,6 +9351,7 @@ impl PowerMonitorApp {
                         .legend(Legend::default().position(Corner::RightTop).background_alpha(0.65))
                         .x_axis_formatter(|mark, _| format_plot_time(mark.value))
                         .show(ui, |plot_ui| {
+                            self.draw_rulers(plot_ui);
                             plot_ui.line(
                                 Line::new(
                                     format!("{} ({})", metric.localized_label(language), metric.unit()),
@@ -10051,10 +10276,28 @@ impl eframe::App for PowerMonitorApp {
         // Recorder::Drop sends Finish and joins its writer thread. Calling it
         // here makes Finder/Command-Q exits flush the 23-column contract.
         self.stop_recording();
-        if !self.demo_mode {
-            let _ = self.cmd_sender.send(UsbCommand::Disconnect);
+        let active = self.streaming || self.device_state.is_some() || self.phase == ConnectionPhase::Connecting;
+        if !self.demo_mode
+            && active
+            && self.cmd_sender.send(UsbCommand::Disconnect).is_ok()
+            && !wait_for_usb_shutdown(&mut self.usb_receiver, Duration::from_millis(1500))
+        {
+            warn!("USB shutdown acknowledgement timed out; recovery recordings are retained");
         }
     }
+}
+
+fn wait_for_usb_shutdown(receiver: &mut mpsc::UnboundedReceiver<UsbMessage>, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match receiver.try_recv() {
+            Ok(UsbMessage::Disconnected | UsbMessage::ConnectionFailed(_))
+            | Err(mpsc::error::TryRecvError::Disconnected) => return true,
+            Ok(_) => {}
+            Err(mpsc::error::TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(5)),
+        }
+    }
+    false
 }
 
 async fn usb_streaming_task(tx: mpsc::UnboundedSender<UsbMessage>, mut cmd_rx: mpsc::UnboundedReceiver<UsbCommand>) {
@@ -10115,6 +10358,7 @@ async fn run_streaming_session(
 
     if !state.adcqueue_enabled {
         error!("AdcQueue not enabled - authentication may have failed");
+        drop(device);
         let _ = tx.send(UsbMessage::ConnectionFailed("AdcQueue not enabled".to_string()));
         return;
     }
@@ -10130,6 +10374,7 @@ async fn run_streaming_session(
     if let Err(e) = start_streaming(&mut device, current_rate, tx).await {
         error!("Failed to start streaming: {}", e);
         let _ = tx.send(UsbMessage::Error(format!("Start failed: {}", e)));
+        drop(device);
         let _ = tx.send(UsbMessage::Disconnected);
         return;
     }
@@ -10291,6 +10536,7 @@ async fn run_streaming_session(
     // Stop streaming and disconnect
     info!("Stopping streaming");
     let _ = device.stop_graph_mode().await;
+    drop(device);
     let _ = tx.send(UsbMessage::Disconnected);
 }
 
@@ -10701,6 +10947,7 @@ mod tests {
             path: PathBuf::from("example.csv"),
             samples: Arc::new(vec![test_measurement(0.0)]),
             metadata: None,
+            derived_accumulators: false,
         });
         assert_eq!(app.source_quality_counts(), None);
         assert!(app.can_export_current_source());
@@ -12140,5 +12387,54 @@ mod tests {
                 }
             }
         });
+    }
+
+    #[test]
+    fn shutdown_waits_for_release_ack_and_is_bounded() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let worker = std::thread::spawn(move || {
+            tx.send(UsbMessage::StreamingStopped).unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+            tx.send(UsbMessage::Disconnected).unwrap();
+        });
+        assert!(wait_for_usb_shutdown(&mut rx, Duration::from_secs(1)));
+        worker.join().unwrap();
+        let (_tx, mut rx) = mpsc::unbounded_channel();
+        let start = Instant::now();
+        assert!(!wait_for_usb_shutdown(&mut rx, Duration::from_millis(20)));
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn rulers_survive_presentation_changes_but_not_source_changes() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let (cmd, _commands) = mpsc::unbounded_channel();
+        let mut app = PowerMonitorApp::new(rx, cmd);
+        let mut first = test_measurement(10.0);
+        first.elapsed_us = 0;
+        let mut second = test_measurement(20.0);
+        second.elapsed_us = 1_000_000;
+        second.sample_index = 1;
+        app.append_measurements(&[first, second]);
+        app.add_ruler(app.cursor_readout_at(0.0));
+        app.add_ruler(app.cursor_readout_at(1.0));
+        app.add_ruler(app.cursor_readout_at(1.0));
+        app.add_ruler(None);
+        assert_eq!(app.rulers.len(), 2);
+        let rulers = app.rulers.clone();
+        app.instrument_rail_collapsed = true;
+        app.chart_viewport.selection = Some(NavigatorSelection {
+            start_seconds: 0.2,
+            end_seconds: 0.8,
+        });
+        app.skin = SkinId::CleanAnime;
+        app.language = Language::English;
+        assert_eq!(app.rulers, rulers);
+        assert_eq!(app.data_points.len(), 2);
+        app.return_to_live();
+        assert!(app.rulers.is_empty());
+        app.add_ruler(app.cursor_readout_at(1.0));
+        app.clear_data();
+        assert!(app.rulers.is_empty());
     }
 }
