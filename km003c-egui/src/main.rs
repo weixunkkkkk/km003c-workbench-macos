@@ -9848,6 +9848,78 @@ mod tests {
     }
 
     #[test]
+    fn imported_chart_controls_align_with_long_filenames_in_both_languages() {
+        for size in [[1024.0, 700.0], [1280.0, 820.0], [1728.0, 1117.0]] {
+            for language in Language::ALL {
+                let (_tx, rx) = mpsc::unbounded_channel();
+                let (cmd, _commands) = mpsc::unbounded_channel();
+                let mut app = PowerMonitorApp::new(rx, cmd);
+                app.language = language;
+                app.plot_source = PlotSource::Imported;
+                app.chart_follow_mode = ChartFollowMode::FullSession;
+                app.time_window = TimeWindow::All;
+                app.imported_recording = Some(ImportedRecording {
+                    path: PathBuf::from("lapower_data_2026-10-06T10-18-09-660Z 45W烤机1小时10分 室温30度.csv"),
+                    samples: Arc::new(
+                        (0..3)
+                            .map(|index| MeasurementSample {
+                                elapsed_us: index * 1_000_000,
+                                sample_index: index,
+                                ..test_measurement(index as f64)
+                            })
+                            .collect(),
+                    ),
+                    metadata: None,
+                    derived_accumulators: true,
+                });
+                let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(size[0], size[1] - 108.0));
+                let ctx = egui::Context::default();
+                theme::apply(&ctx, SkinId::Industrial);
+                theme::install_fonts(&ctx);
+                for _ in 0..3 {
+                    let output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(screen),
+                            ..Default::default()
+                        },
+                        |ui| app.show_monitor_page(ui),
+                    );
+                    let mut buttons = Vec::new();
+                    for labels in [
+                        ["全程", "Full session"].as_slice(),
+                        ["标尺 (0)", "Rulers (0)"].as_slice(),
+                        ["固定", "固定游标", "Pin", "Pin cursor"].as_slice(),
+                    ] {
+                        let text = output.shapes.iter().find_map(|shape| match &shape.shape {
+                            egui::Shape::Text(text) if labels.contains(&text.galley.job.text.as_str()) => Some(text),
+                            _ => None,
+                        });
+                        let text = text.unwrap_or_else(|| panic!("missing {labels:?}, {size:?} {language:?}"));
+                        let center = text.pos + text.galley.rect.center().to_vec2();
+                        let rect = output
+                            .shapes
+                            .iter()
+                            .filter_map(|shape| match &shape.shape {
+                                egui::Shape::Rect(rect) if rect.rect.contains(center) => Some(rect.rect),
+                                _ => None,
+                            })
+                            .min_by(|a, b| a.area().total_cmp(&b.area()))
+                            .unwrap();
+                        assert!(screen.contains_rect(rect), "{size:?} {language:?}: {rect:?}");
+                        buttons.push(rect);
+                    }
+                    assert!(
+                        buttons.iter().all(|rect| {
+                            (rect.top() - buttons[0].top()).abs() < 0.5 && (rect.height() - 32.0).abs() < 0.5
+                        }),
+                        "{size:?} {language:?}: {buttons:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn accumulated_readings_align_numbers_and_units_without_direction_drift() {
         let ctx = egui::Context::default();
         for width in [180.0, 218.0] {
