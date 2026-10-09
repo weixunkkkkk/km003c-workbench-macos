@@ -166,6 +166,14 @@ fn parse_framed_response(bytes: &[u8]) -> Option<RawPacket> {
     RawPacket::try_from(Bytes::copy_from_slice(bytes)).ok()
 }
 
+/// Drops buffered responses that carry `id`. They answer an earlier request:
+/// eight-bit transaction IDs roll over every 256 requests (about 1.3 s at the
+/// 1000 SPS polling rate), so a late reply queued after a timeout would
+/// otherwise be returned as the answer to the request that reuses its ID.
+fn discard_stale_responses(pending: &mut VecDeque<Vec<u8>>, id: u8) {
+    pending.retain(|response| !parse_framed_response(response).is_some_and(|packet| packet.id() == id));
+}
+
 fn response_matches(bytes: &[u8], id: u8, packet_type: PacketType) -> bool {
     parse_framed_response(bytes).is_some_and(|packet| packet.id() == id && packet.packet_type() == packet_type)
 }
@@ -576,6 +584,7 @@ impl KM003C {
     fn next_transaction_id(&mut self) -> u8 {
         let id = self.transaction_id;
         self.transaction_id = self.transaction_id.wrapping_add(1);
+        discard_stale_responses(&mut self.pending_responses, id);
         id
     }
 
@@ -1270,7 +1279,17 @@ impl KM003C {
         }
 
         let id = self.send_tracked(Packet::StopGraph).await?;
-        self.expect_accept(id, "StopGraph").await?;
+        match self.receive_control_response(id).await? {
+            Packet::Accept { .. } => {}
+            // The firmware stops streaming on its own when it is not polled
+            // for a while and then rejects StopGraph. It is already stopped.
+            Packet::Reject { .. } => debug!("StopGraph rejected, the device was not streaming"),
+            other => {
+                return Err(KMError::Protocol(format!(
+                    "Expected Accept for StopGraph, got {other:?}"
+                )));
+            }
+        }
         self.graph_sample_rate = None;
         Ok(())
     }
@@ -1326,6 +1345,18 @@ mod tests {
         assert!(!response_matches(&[0xc1, 8, 0, 0], 7, PacketType::PutData));
         assert!(!response_matches(&[0xc0, 7, 0, 0], 7, PacketType::PutData));
         assert!(!response_matches(&[0xc1], 7, PacketType::PutData));
+    }
+
+    #[test]
+    fn reused_transaction_id_discards_only_stale_framed_responses() {
+        let mut pending = VecDeque::from(vec![
+            vec![0xc1, 7, 0, 0], // late reply to the previous request that used ID 7
+            vec![0xc1, 8, 0, 0], // still-pending reply for another request
+            vec![0xc1],          // unframed transfer; cannot be correlated, keep it
+            vec![0xc1, 7, 0, 0],
+        ]);
+        discard_stale_responses(&mut pending, 7);
+        assert_eq!(pending, VecDeque::from(vec![vec![0xc1, 8, 0, 0], vec![0xc1]]));
     }
 
     #[test]

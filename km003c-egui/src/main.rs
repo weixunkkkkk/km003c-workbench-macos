@@ -1,6 +1,7 @@
 mod chart_view;
 mod connection;
 mod i18n;
+mod logging;
 mod measurement;
 mod offline_export;
 mod offline_view;
@@ -12,11 +13,13 @@ mod recording;
 mod recording_copy;
 mod recording_import;
 mod recording_session;
+mod single_instance;
 mod sleep_assertion;
 mod theme;
+mod usb_task;
 
 use chart_view::{ChartObservationMode, RangeMode, TraceRange};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use connection::ConnectionPhase;
 use eframe::egui;
 use egui_plot::{
@@ -25,9 +28,8 @@ use egui_plot::{
 use i18n::{APP_BUILD, APP_ID, APP_TITLE, APP_VERSION, Language};
 use km003c_lib::uom::si::electric_potential::volt;
 use km003c_lib::{
-    AdcQueueSample, DeviceConfig, DeviceState, GraphSampleRate, KM003C, LogMetadata, OfflineLog, PdTrace,
-    packet::{Attribute, AttributeSet},
-    pd::{PdEvent, PdEventData, PdStatus},
+    DeviceState, GraphSampleRate, LogMetadata,
+    pd::{PdEventData, PdStatus},
 };
 use measurement::{MeasurementAccumulator, MeasurementSample, PlotMetric};
 use offline_export::{OfflineExportEvent, OfflineExportTask};
@@ -45,166 +47,32 @@ use recording_session::{
     RecordingTimeInterval, SessionState, discover_recoverable_sessions, merge_session_segments, read_sidecar,
     write_manifest, write_sidecar,
 };
-use sleep_assertion::IdleSleepAssertion;
+use single_instance::SingleInstanceGuard;
+use sleep_assertion::{IdleSleepAssertion, StreamingActivity};
 use std::collections::{HashMap, VecDeque};
-#[cfg(unix)]
-use std::fs::{File, OpenOptions};
-use std::io;
-#[cfg(unix)]
-use std::io::Write;
-#[cfg(unix)]
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-#[cfg(unix)]
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
+use usb_task::{UsbCommand, UsbMessage, usb_streaming_task};
 
 /// Keep a macOS unlock catch-up burst from monopolizing the egui thread.
 /// Consecutive sample messages are coalesced into one recorder hand-off, and
 /// any remaining backlog is handled on the next repaint.
 const MAX_USB_MESSAGES_PER_FRAME: usize = 64;
 
-struct SingleInstanceGuard {
-    #[cfg(unix)]
-    lock_file: File,
-    #[cfg(unix)]
-    lock_path: PathBuf,
-    #[cfg(unix)]
-    activation_path: PathBuf,
-    #[cfg(unix)]
-    activation_cursor: AtomicU64,
-}
+/// Upper bound for letting the USB task send StopGraph and release the device
+/// while the application quits. A normal stop takes a few milliseconds.
+const USB_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(1500);
 
-impl SingleInstanceGuard {
-    #[cfg(unix)]
-    fn acquire(app_id: &str) -> io::Result<Option<Self>> {
-        let (lock_path, activation_path) = instance_lock_paths(app_id);
-        let lock_file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)?;
+/// `logic` cadence without a stream: connection retries, PD timeouts and the
+/// 0.1 s recording clock.
+const IDLE_REPAINT_INTERVAL: Duration = Duration::from_millis(100);
 
-        // SAFETY: `lock_file` owns a valid descriptor for the duration of the
-        // call. `flock` neither retains the pointer nor accesses Rust memory.
-        let lock_result = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if lock_result == 0 {
-            std::fs::write(&activation_path, [])?;
-            return Ok(Some(Self {
-                lock_file,
-                lock_path,
-                activation_path,
-                activation_cursor: AtomicU64::new(0),
-            }));
-        }
-
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::WouldBlock {
-            return Err(error);
-        }
-
-        // The secondary process only appends an activation byte, then exits.
-        // The primary polls the file length from its normal egui frame loop.
-        let mut activation_file = OpenOptions::new().create(true).append(true).open(&activation_path)?;
-        activation_file.write_all(b"1")?;
-        activation_file.sync_data()?;
-        Ok(None)
-    }
-
-    #[cfg(unix)]
-    fn activation_requested(&self) -> bool {
-        let length = std::fs::metadata(&self.activation_path)
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
-        let previous = self.activation_cursor.swap(length, Ordering::AcqRel);
-        length > previous
-    }
-
-    #[cfg(not(unix))]
-    fn acquire(_app_id: &str) -> io::Result<Option<Self>> {
-        Ok(Some(Self {}))
-    }
-
-    #[cfg(not(unix))]
-    const fn activation_requested(&self) -> bool {
-        false
-    }
-}
-
-#[cfg(unix)]
-impl Drop for SingleInstanceGuard {
-    fn drop(&mut self) {
-        // SAFETY: the descriptor remains valid until this struct is dropped.
-        let _ = unsafe { libc::flock(self.lock_file.as_raw_fd(), libc::LOCK_UN) };
-        let _ = std::fs::remove_file(&self.activation_path);
-        let _ = std::fs::remove_file(&self.lock_path);
-    }
-}
-
-fn instance_lock_paths(app_id: &str) -> (PathBuf, PathBuf) {
-    // Keep production, demo and test instances isolated without exposing the
-    // full bundle identifier in temporary filenames.
-    let hash = app_id.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
-    });
-    let root = std::env::temp_dir();
-    (
-        root.join(format!("km003c-{hash:016x}.lock")),
-        root.join(format!("km003c-{hash:016x}.activate")),
-    )
-}
-
-/// Message from USB task to UI
-#[derive(Debug, Clone)]
-enum UsbMessage {
-    /// Device connected and initialized
-    Connected(Arc<DeviceState>),
-    /// Connection failed
-    ConnectionFailed(String),
-    /// New AdcQueue samples received
-    Samples(Vec<AdcQueueSample>),
-    /// PD events received from device
-    PdEvents(Vec<PdEvent>),
-    /// PD status (CC line voltages)
-    PdStatusUpdate(PdStatus),
-    /// Firmware Type-C and protocol-engine trace
-    PdTrace(PdTrace),
-    /// Device offline-recording catalog
-    OfflineCatalog(Vec<LogMetadata>),
-    /// Complete selected offline recording
-    OfflineLogDownloaded(OfflineLog),
-    /// Offline catalog or download operation failed
-    OfflineOperationFailed(String),
-    /// Streaming started at given rate
-    StreamingStarted(GraphSampleRate),
-    /// Streaming stopped
-    StreamingStopped,
-    /// Error during streaming
-    Error(String),
-    /// Disconnected
-    Disconnected,
-}
-
-/// Command from UI to USB task
-#[derive(Debug, Clone)]
-enum UsbCommand {
-    /// Connect to device and start streaming
-    Connect(GraphSampleRate, bool),
-    /// Change sample rate (stops current streaming, starts with new rate)
-    SetSampleRate(GraphSampleRate),
-    /// Enable or disable firmware PD trace collection
-    SetPdTraceEnabled(bool),
-    /// Fetch the catalog of recordings stored by the device
-    RequestOfflineCatalog,
-    /// Download one catalog entry from device memory
-    DownloadOfflineLog(LogMetadata),
-    /// Stop streaming and disconnect
-    Disconnect,
-}
+/// Every display frame. egui subtracts one predicted frame (1/60 s) from a
+/// requested delay, so 16 ms schedules the next frame immediately.
+const FRAME_REPAINT_INTERVAL: Duration = Duration::from_millis(16);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlotSource {
@@ -1244,17 +1112,37 @@ fn apply_recording_offsets(mut sample: MeasurementSample, offsets: RecordingOffs
     sample
 }
 
+/// Storage identity of this process: [`APP_ID`], [`DEMO_APP_ID`] in demo mode,
+/// or `KM003C_NATIVE_APP_ID`. Set once in `main`; unset (tests) means
+/// [`APP_ID`].
+static RUNTIME_APP_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 fn application_recordings_directory() -> PathBuf {
-    if let Some(storage_root) = std::env::var_os("KM003C_STORAGE_ROOT") {
+    recordings_directory_for(
+        RUNTIME_APP_ID.get().map_or(APP_ID, String::as_str),
+        std::env::var_os("KM003C_STORAGE_ROOT"),
+        std::env::var_os("HOME"),
+    )
+}
+
+/// Recordings live with the preferences and logs of the running app id, so
+/// a demo session neither writes into the real app's pending recordings nor
+/// offers to recover or delete them.
+fn recordings_directory_for(
+    app_id: &str,
+    storage_root: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> PathBuf {
+    if let Some(storage_root) = storage_root {
         return PathBuf::from(storage_root).join("Recordings");
     }
-    std::env::var_os("HOME").map_or_else(
-        || std::env::temp_dir().join(APP_ID).join("Recordings"),
+    home.map_or_else(
+        || std::env::temp_dir().join(app_id).join("Recordings"),
         |home| {
             PathBuf::from(home)
                 .join("Library")
                 .join("Application Support")
-                .join(APP_ID)
+                .join(app_id)
                 .join("Recordings")
         },
     )
@@ -1346,6 +1234,21 @@ impl SampleRateOption {
             Self::Sps10 => 10,
             Self::Sps50 => 50,
             Self::Sps1000 => 1_000,
+        }
+    }
+
+    /// How often `logic` runs while this rate streams. The USB task never
+    /// wakes the UI, so this is also the longest a new sample waits before it
+    /// is processed and drawn. The values give roughly 10, 20 and 30 frames
+    /// per second for 2, 10 and 50 samples per second, and every display
+    /// frame at 1000: redrawing a 2 SPS chart on every frame paints each
+    /// sample 30 times (60 on a 120 Hz display) without changing a pixel.
+    const fn streaming_repaint_interval(self) -> Duration {
+        match self {
+            Self::Sps2 => IDLE_REPAINT_INTERVAL,
+            Self::Sps10 => Duration::from_millis(50),
+            Self::Sps50 => Duration::from_millis(33),
+            Self::Sps1000 => FRAME_REPAINT_INTERVAL,
         }
     }
 
@@ -1619,6 +1522,9 @@ struct PowerMonitorApp {
     /// turn off; only automatic system sleep is inhibited.
     sleep_protection_enabled: bool,
     sleep_assertion: Option<IdleSleepAssertion>,
+    /// Held while the device streams so App Nap cannot throttle USB polling
+    /// behind a hidden window. Reconciled with `streaming` every logic pass.
+    streaming_activity: Option<StreamingActivity>,
 }
 
 struct FinalizingSegment {
@@ -1646,6 +1552,7 @@ impl PowerMonitorApp {
         {
             app.apply_preferences(prefs);
         }
+        theme::install_fonts(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx, app.skin);
         app.load_skin_assets(&cc.egui_ctx);
         if demo_mode {
@@ -1797,6 +1704,7 @@ impl PowerMonitorApp {
             usb_reset: false,
             sleep_protection_enabled: true,
             sleep_assertion: None,
+            streaming_activity: None,
         }
     }
 
@@ -2031,8 +1939,8 @@ impl PowerMonitorApp {
                         self.recording_status = self
                             .language
                             .pick(
-                                "USB 已重连 · 正在续录同一段记录",
-                                "USB reconnected · Continuing the same recording",
+                                "采样已恢复 · 正在续录同一段记录",
+                                "Sampling restored · Continuing the same recording",
                             )
                             .to_string();
                     }
@@ -2140,6 +2048,19 @@ impl PowerMonitorApp {
                     }
                     self.offline_status = format!("离线记录操作失败：{error}");
                 }
+                UsbMessage::StreamingStalled(last_samples) => {
+                    if self.recording_session && !self.recording_paused {
+                        let now = Utc::now();
+                        let started_at = chrono::Duration::from_std(last_samples.elapsed())
+                            .ok()
+                            .and_then(|duration| now.checked_sub_signed(duration))
+                            .unwrap_or(now);
+                        self.pause_recording_with_reason(PauseReason::UsbDisconnected, started_at);
+                        if self.recording_phase == RecordingPhase::Paused {
+                            self.recording_phase = RecordingPhase::Recovering;
+                        }
+                    }
+                }
                 UsbMessage::StreamingStopped => {
                     self.streaming = false;
                     if self.device_state.is_some() {
@@ -2171,7 +2092,7 @@ impl PowerMonitorApp {
                     self.pd_connection = PdConnectionTracker::default();
                     self.offline_busy = false;
                     if self.recording_session && !self.disconnect_requested {
-                        self.pause_recording_with_reason(PauseReason::UsbDisconnected);
+                        self.pause_recording_with_reason(PauseReason::UsbDisconnected, Utc::now());
                         self.recording_phase = RecordingPhase::WaitingForReconnect;
                         self.recording_status = self
                             .language
@@ -2293,17 +2214,17 @@ impl PowerMonitorApp {
     }
 
     fn pause_recording(&mut self) {
-        self.pause_recording_with_reason(PauseReason::Manual);
+        self.pause_recording_with_reason(PauseReason::Manual, Utc::now());
     }
 
-    fn pause_recording_with_reason(&mut self, reason: PauseReason) {
+    fn pause_recording_with_reason(&mut self, reason: PauseReason, started_at_utc: DateTime<Utc>) {
         if !self.recording_session || self.recording_paused {
             return;
         }
         if let Some(metadata) = &mut self.recording_session_metadata {
             let interval = RecordingTimeInterval {
                 reason: reason.interval_reason(),
-                started_at_utc: Utc::now(),
+                started_at_utc: started_at_utc.max(metadata.timestamps.started_at_utc),
                 ended_at_utc: None,
             };
             if reason == PauseReason::UsbDisconnected {
@@ -2942,7 +2863,7 @@ impl PowerMonitorApp {
                     }
                 }
                 if should_auto_pause {
-                    self.pause_recording_with_reason(PauseReason::Automatic(auto_rule.metric));
+                    self.pause_recording_with_reason(PauseReason::Automatic(auto_rule.metric), Utc::now());
                     self.recording_status = format!(
                         "{} · {} {:.1} s ≤ {:.3} {}",
                         self.language.pick("已自动暂停", "Auto-paused"),
@@ -3809,7 +3730,10 @@ impl PowerMonitorApp {
                         metadata.end_elapsed_us = summary.elapsed_us;
                         metadata.sealed = true;
                     }
-                    if let Some(metadata) = &mut self.recording_session_metadata {
+                    // Older segments may finish after a newer segment has already sealed.
+                    if let Some(metadata) = &mut self.recording_session_metadata
+                        && summary.rows >= metadata.rows
+                    {
                         metadata.update_from_summary(&summary);
                         metadata.refresh_durations(Utc::now());
                     }
@@ -3914,6 +3838,13 @@ impl PowerMonitorApp {
                     summary.completeness_percent(),
                     destination.display(),
                 );
+                if metadata.disconnected_duration_ms > 0 {
+                    self.recording_status.push_str(&format!(
+                        " · {} {}",
+                        self.language.pick("采集中断", "Capture interrupted"),
+                        format_recording_duration(Duration::from_millis(metadata.disconnected_duration_ms)),
+                    ));
+                }
                 self.recording_phase = RecordingPhase::Saved;
                 self.pending_save_destination = None;
                 self.finish_recording_session();
@@ -4743,6 +4674,44 @@ impl PowerMonitorApp {
         }
     }
 
+    /// Whether the USB task is inside a device session and will answer
+    /// `Disconnect` with `Disconnected`. Outside a session it ignores the
+    /// command, so waiting for an answer would only delay quitting.
+    fn usb_session_active(&self) -> bool {
+        self.streaming || self.device_state.is_some() || self.phase == ConnectionPhase::Connecting
+    }
+
+    /// Blocks until the USB task reports that the device was released, the
+    /// task ends, or `timeout` passes. Returns whether the task confirmed.
+    /// Only for quitting: every other message is dropped unprocessed.
+    fn wait_for_usb_shutdown(&mut self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.usb_receiver.try_recv() {
+                Ok(UsbMessage::Disconnected | UsbMessage::ConnectionFailed(_))
+                | Err(mpsc::error::TryRecvError::Disconnected) => return true,
+                Ok(_) => {}
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    if Instant::now() >= deadline {
+                        return false;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+    }
+
+    /// Holds the App Nap opt-out exactly while samples are expected. Without
+    /// it, macOS may coalesce the USB polling timers of a hidden window long
+    /// enough for the device queue to overflow or for streaming to stall.
+    fn sync_streaming_activity(&mut self) {
+        match (self.streaming, self.streaming_activity.is_some()) {
+            (true, false) => self.streaming_activity = Some(StreamingActivity::begin()),
+            (false, true) => self.streaming_activity = None,
+            _ => {}
+        }
+    }
+
     /// Runs even when eframe skips painting an occluded or minimized window.
     /// Sampling, recording and their next wake-up must never depend on `ui`.
     fn update_runtime(&mut self, ctx: &egui::Context) {
@@ -4761,12 +4730,26 @@ impl PowerMonitorApp {
         let usb_backlog = self.process_messages();
         self.finish_measurement_restart();
         self.update_demo_data();
+        self.sync_streaming_activity();
+        match self.next_logic_delay(usb_backlog) {
+            Duration::ZERO => ctx.request_repaint(),
+            delay => ctx.request_repaint_after(delay),
+        }
+    }
+
+    /// Delay before `logic` runs again: at once while USB messages are queued
+    /// beyond one frame's budget, at the pace of the stream while sampling,
+    /// and at the idle cadence otherwise.
+    fn next_logic_delay(&self, usb_backlog: bool) -> Duration {
         if usb_backlog {
-            ctx.request_repaint();
-        } else if self.streaming {
-            ctx.request_repaint_after(Duration::from_millis(16));
+            Duration::ZERO
+        } else if !self.streaming {
+            IDLE_REPAINT_INTERVAL
+        } else if self.demo_mode {
+            // The demo generator emits at most one sample per pass.
+            FRAME_REPAINT_INTERVAL
         } else {
-            ctx.request_repaint_after(Duration::from_millis(100));
+            self.current_rate.streaming_repaint_interval()
         }
     }
 
@@ -6372,6 +6355,26 @@ impl PowerMonitorApp {
                         )
                         .clicked();
                 });
+                if let Some(metadata) = self
+                    .imported_recording
+                    .as_ref()
+                    .filter(|_| self.plot_source == PlotSource::Imported)
+                    .and_then(|recording| recording.metadata.as_ref())
+                    && !metadata.disconnect_intervals.is_empty()
+                {
+                    ui.colored_label(
+                        theme::POWER,
+                        format!(
+                            "{} {} · {}",
+                            language.pick("采集中断", "Capture interrupted"),
+                            format_recording_duration(Duration::from_millis(metadata.disconnected_duration_ms)),
+                            language.pick(
+                                "完整度仅针对有效采样区间",
+                                "Completeness covers captured intervals only"
+                            ),
+                        ),
+                    );
+                }
             });
         ui.add_space(4.0);
         if close {
@@ -9169,874 +9172,6 @@ impl eframe::App for PowerMonitorApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.show_workbench(ui);
-        #[cfg(any())]
-        {
-            self.process_messages();
-            self.update_demo_data();
-
-            // Request repaints - fast when streaming, slower when idle
-            if self.streaming && self.plot_source == PlotSource::Live {
-                ui.ctx().request_repaint_after(Duration::from_millis(16)); // ~60fps when streaming
-            } else {
-                ui.ctx().request_repaint_after(Duration::from_millis(100)); // 10fps when idle
-            }
-
-            // Top status rail: phase is written as text and color, so color is not
-            // the only way to understand a connection or recording condition.
-            egui::Panel::top("header").show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading(APP_TITLE);
-                    ui.separator();
-                    let status_color = match self.phase {
-                        ConnectionPhase::Streaming => theme::VOLTAGE,
-                        ConnectionPhase::Searching | ConnectionPhase::Connecting => theme::POWER,
-                        ConnectionPhase::NoDevice | ConnectionPhase::Disconnected => {
-                            egui::Color32::from_rgb(0xB8, 0xC3, 0xCF)
-                        }
-                        ConnectionPhase::DeviceBusy | ConnectionPhase::ConnectionError => {
-                            egui::Color32::from_rgb(0xFF, 0x76, 0x76)
-                        }
-                    };
-                    ui.colored_label(status_color, i18n::connection_status(self.language, self.phase));
-                    ui.colored_label(status_color, &self.status);
-                    ui.separator();
-                    ui.monospace(format!(
-                        "{} · v{} ({})",
-                        self.current_rate.label(),
-                        APP_VERSION,
-                        APP_BUILD
-                    ));
-                    if self.demo_mode {
-                        ui.colored_label(theme::POWER, "演示数据");
-                    }
-                    if self.recording_session {
-                        let recording_label = if self.recorder.as_ref().is_some_and(|recorder| recorder.is_finishing())
-                        {
-                            "正在保存"
-                        } else if self.recording_paused {
-                            "录制已暂停"
-                        } else {
-                            "录制中"
-                        };
-                        ui.colored_label(theme::POWER, recording_label);
-                    } else if self.recorder.is_some() {
-                        ui.colored_label(theme::POWER, "正在导出");
-                    }
-                });
-            });
-
-            // Large, glanceable values stay above the plots at all window sizes.
-            egui::Frame::group(ui.style())
-                .fill(theme::backplane())
-                .stroke(egui::Stroke::new(1.0, theme::divider()))
-                .show(ui, |ui| {
-                    ui.set_min_width(ui.available_width());
-                    ui.horizontal_wrapped(|ui| {
-                        metric_card(ui, "电压", self.current_voltage, "V", theme::VOLTAGE);
-                        metric_card(ui, "电流", self.current_current.abs(), "A", theme::CURRENT);
-                        metric_card(ui, "功率", self.current_power.abs(), "W", theme::POWER);
-                    });
-                });
-
-            // Prominent recording controls follow the instrument-style toolbar
-            // used by dedicated USB power meters. The live graph remains the
-            // existing KM003C view, while this strip makes the saved segment and
-            // its two key totals visible at a glance.
-            self.show_recording_toolbar(ui);
-
-            // Left panel with device info and controls
-            egui::Panel::left("info_panel").min_size(280.0).show(ui, |ui| {
-            egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
-            ui.heading("设备信息");
-            ui.separator();
-
-            if let Some(state) = &self.device_state {
-                egui::Grid::new("device_info_grid")
-                    .num_columns(2)
-                    .spacing([10.0, 4.0])
-                    .show(ui, |ui| {
-                        ui.label("型号");
-                        ui.label(&state.info.model);
-                        ui.end_row();
-
-                        ui.label("固件");
-                        ui.label(&state.info.fw_version);
-                        ui.end_row();
-
-                        ui.label("固件日期");
-                        ui.label(&state.info.fw_date);
-                        ui.end_row();
-
-                        ui.label("硬件版本");
-                        ui.label(&state.info.hw_version);
-                        ui.end_row();
-
-                        ui.label("生产日期");
-                        ui.label(&state.info.mfg_date);
-                        ui.end_row();
-
-                        ui.label("序列号");
-                        ui.label(&state.info.serial_id);
-                        ui.end_row();
-
-                        ui.label("硬件 ID");
-                        ui.label(format!("{}", state.hardware_id));
-                        ui.end_row();
-
-                        ui.label("鉴权级别");
-                        ui.label(format!("{}", state.auth_level));
-                        ui.end_row();
-
-                        ui.label("AdcQueue");
-                        ui.colored_label(
-                            if state.adcqueue_enabled {
-                                egui::Color32::GREEN
-                            } else {
-                                egui::Color32::RED
-                            },
-                            if state.adcqueue_enabled { "已启用" } else { "未启用" },
-                        );
-                        ui.end_row();
-                    });
-            } else {
-                ui.label("未连接");
-            }
-
-            ui.add_space(20.0);
-            ui.separator();
-            ui.heading("实时读数");
-            ui.separator();
-
-            instrument_readout_card(
-                ui,
-                "电压",
-                self.current_voltage,
-                "V",
-                theme::VOLTAGE,
-                self.recording_statistics.voltage.readout(),
-            );
-            ui.add_space(5.0);
-            instrument_readout_card(
-                ui,
-                "电流",
-                self.current_current.abs(),
-                "A",
-                theme::CURRENT,
-                self.recording_statistics.current.readout(),
-            );
-            ui.add_space(5.0);
-            instrument_readout_card(
-                ui,
-                "功率",
-                self.current_power.abs(),
-                "W",
-                theme::POWER,
-                self.recording_statistics.power.readout(),
-            );
-
-            ui.add_space(10.0);
-            if let Some(accumulated) = self.accumulated_readout() {
-                ui.label(egui::RichText::new("累计参数").strong());
-                egui::Grid::new("accumulated_grid")
-                    .num_columns(2)
-                    .spacing([10.0, 4.0])
-                    .show(ui, |ui| {
-                        ui.colored_label(theme::POWER, "累计能量");
-                        ui.monospace(format_cumulative_energy(accumulated.cumulative_energy_uwh));
-                        ui.end_row();
-                        ui.colored_label(theme::CURRENT, "累计容量");
-                        ui.monospace(format_capacity(accumulated.capacity_uah));
-                        ui.end_row();
-                        ui.colored_label(theme::POWER, "净能量");
-                        ui.monospace(
-                            EnergyPresentation::for_values([accumulated.net_energy_uwh])
-                                .format_directional(accumulated.net_energy_uwh),
-                        );
-                        ui.end_row();
-                    });
-            }
-
-            ui.add_space(20.0);
-            ui.separator();
-            ui.heading("PD 状态");
-            ui.separator();
-
-            if let Some(pd) = &self.pd_status {
-                egui::Grid::new("pd_status_grid")
-                    .num_columns(2)
-                    .spacing([10.0, 4.0])
-                    .show(ui, |ui| {
-                        ui.label("CC1");
-                        let cc1_v = pd.cc1.get::<volt>();
-                        let cc1_color = if self.pd_connection.connected() == Some(true) && cc1_v > 0.2 {
-                            egui::Color32::GREEN
-                        } else {
-                            egui::Color32::GRAY
-                        };
-                        ui.colored_label(cc1_color, format!("{cc1_v:.3} V"));
-                        ui.end_row();
-
-                        ui.label("CC2");
-                        let cc2_v = pd.cc2.get::<volt>();
-                        let cc2_color = if self.pd_connection.connected() == Some(true) && cc2_v > 0.2 {
-                            egui::Color32::GREEN
-                        } else {
-                            egui::Color32::GRAY
-                        };
-                        ui.colored_label(cc2_color, format!("{cc2_v:.3} V"));
-                        ui.end_row();
-
-                        ui.label("Type-C sink");
-                        let (color, label) = match self.pd_connection.connected() {
-                            Some(true) => (theme::VOLTAGE, "已连接"),
-                            Some(false) => (egui::Color32::from_rgb(0xFF, 0x76, 0x76), "未连接"),
-                            None => (theme::POWER, "检测中…"),
-                        };
-                        ui.colored_label(color, label);
-                        ui.end_row();
-                    });
-            } else {
-                ui.label("暂无 PD 数据");
-            }
-
-            ui.add_space(20.0);
-            ui.separator();
-            ui.heading("PD 时间线");
-            ui.separator();
-
-            ui.checkbox(&mut self.pd_panel_visible, "显示 PD 面板");
-            ui.label("筛选");
-            ui.checkbox(&mut self.pd_protocol_visible, "协议报文");
-            let trace_changed = ui
-                .checkbox(&mut self.pd_trace_enabled, "固件 trace")
-                .on_hover_text(
-                    "Also drains the diagnostic Type-C and protocol-engine queues reverse engineered from KM003C firmware V1.9.9",
-                )
-                .changed();
-            if trace_changed && self.device_state.is_some() {
-                let _ = self
-                    .cmd_sender
-                    .send(UsbCommand::SetPdTraceEnabled(self.pd_trace_enabled));
-            }
-
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut self.pd_auto_scroll, "自动滚动");
-                if ui.button("清空时间线").clicked() {
-                    self.clear_pd_log();
-                }
-            });
-            ui.label(format!(
-                "协议：{}  |  Trace：{}",
-                self.pd_log.len(),
-                self.pd_trace_log.len()
-            ));
-
-            ui.add_space(20.0);
-            ui.separator();
-            ui.heading("采集统计");
-            ui.separator();
-
-            egui::Grid::new("stats_grid")
-                .num_columns(2)
-                .spacing([10.0, 4.0])
-                .show(ui, |ui| {
-                    ui.label("采样点");
-                    ui.label(format!("{}", self.total_samples));
-                    ui.end_row();
-
-                    ui.label("丢失");
-                    ui.colored_label(
-                        if self.dropped_samples > 0 {
-                            egui::Color32::RED
-                        } else {
-                            egui::Color32::GREEN
-                        },
-                        format!("{}", self.dropped_samples),
-                    );
-                    ui.end_row();
-
-                    ui.label("丢弃");
-                    ui.colored_label(
-                        if self.discarded_sequence_samples > 0 {
-                            egui::Color32::YELLOW
-                        } else {
-                            egui::Color32::GREEN
-                        },
-                        format!("{}", self.discarded_sequence_samples),
-                    );
-                    ui.end_row();
-
-                    ui.label("缓冲区");
-                    ui.label(format!("{} 点", self.data_points.len()));
-                    ui.end_row();
-                });
-
-            ui.add_space(20.0);
-            ui.separator();
-            ui.heading("设备与采集控制");
-            ui.separator();
-
-            // Sample rate selector
-            ui.add_enabled_ui(self.recorder.is_none(), |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("采样率");
-                    let prev_rate = self.selected_rate;
-                    egui::ComboBox::from_id_salt("sample_rate")
-                        .selected_text(self.selected_rate.label())
-                        .show_ui(ui, |ui| {
-                            for rate in SampleRateOption::all() {
-                                ui.selectable_value(&mut self.selected_rate, *rate, rate.label());
-                            }
-                        });
-
-                    if self.selected_rate != prev_rate && self.device_state.is_some() {
-                        info!("Sample rate changed to {}", self.selected_rate.label());
-                        let _ = self
-                            .cmd_sender
-                            .send(UsbCommand::SetSampleRate(self.selected_rate.to_graph_rate()));
-                    }
-                });
-            });
-
-            ui.collapsing("自动暂停（高级）", |ui| {
-                let mut changed = ui
-                    .checkbox(&mut self.auto_pause_enabled, "低功率持续后自动暂停")
-                    .changed();
-                ui.horizontal(|ui| {
-                    ui.label("功率阈值");
-                    changed |= ui
-                        .add(
-                            egui::DragValue::new(&mut self.auto_pause_threshold_mw)
-                                .range(0..=100_000)
-                                .suffix(" mW"),
-                        )
-                        .changed();
-                });
-                let mut delay_seconds = self.auto_pause_delay_ms as f64 / 1_000.0;
-                ui.horizontal(|ui| {
-                    ui.label("持续时间");
-                    if ui
-                        .add(
-                            egui::DragValue::new(&mut delay_seconds)
-                                .range(0.1..=600.0)
-                                .speed(0.1)
-                                .suffix(" s"),
-                        )
-                        .changed()
-                    {
-                        self.auto_pause_delay_ms = (delay_seconds * 1_000.0).round() as u32;
-                        changed = true;
-                    }
-                });
-                if changed {
-                    self.auto_pause_below_since_us = None;
-                }
-                ui.small("只暂停录制，实时曲线继续更新；点击“继续记录”可恢复。默认关闭。");
-            });
-
-            ui.add_space(5.0);
-
-            // Time window selector
-            ui.horizontal(|ui| {
-                ui.label("时间窗");
-                let previous_window = self.time_window;
-                egui::ComboBox::from_id_salt("time_window")
-                    .selected_text(self.time_window.label())
-                    .show_ui(ui, |ui| {
-                        for window in TimeWindow::all() {
-                            ui.selectable_value(&mut self.time_window, *window, window.label());
-                        }
-                    });
-                if self.time_window != previous_window {
-                    self.cursor_readout = None;
-                    self.reset_plots_requested = true;
-                }
-            });
-
-            ui.add_space(10.0);
-            ui.label("曲线指标");
-            for (index, metric) in self.plot_metrics.iter_mut().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.label(format!("{}:", index + 1));
-                    egui::ComboBox::from_id_salt(("plot_metric", index))
-                        .selected_text(metric.label())
-                        .show_ui(ui, |ui| {
-                            for option in PlotMetric::ALL {
-                                if self.plot_source == PlotSource::Live || option.supports_offline() {
-                                    ui.selectable_value(metric, option, option.label());
-                                }
-                            }
-                        });
-                });
-            }
-
-            ui.add_space(10.0);
-
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(self.can_clear_live_data(), egui::Button::new("清空实时数据"))
-                    .clicked()
-                {
-                    self.clear_data_confirmation = true;
-                }
-                if ui.button("恢复图表").clicked() {
-                    self.cursor_readout = None;
-                    self.reset_plots_requested = true;
-                }
-            });
-
-            ui.add_space(20.0);
-            ui.separator();
-            ui.heading("录制与导出");
-            ui.separator();
-
-            ui.add_enabled_ui(self.recorder.is_none(), |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("格式");
-                    egui::ComboBox::from_id_salt("recording_format")
-                        .selected_text(self.recording_format.label())
-                        .show_ui(ui, |ui| {
-                            for format in RecordingFormat::ALL {
-                                ui.selectable_value(&mut self.recording_format, format, format.label());
-                            }
-                        });
-                });
-            });
-
-            match &self.recorder {
-                Some(recorder) if recorder.is_finishing() => {
-                    ui.add_enabled(false, egui::Button::new("正在安全结束…"));
-                }
-                Some(_) if self.recording_session => {
-                    ui.horizontal(|ui| {
-                        let toggle_label = if self.recording_paused {
-                            "继续录制"
-                        } else {
-                            "暂停录制"
-                        };
-                        if ui.button(toggle_label).clicked() {
-                            if self.recording_paused {
-                                self.resume_recording();
-                            } else {
-                                self.pause_recording();
-                            }
-                        }
-                        if ui.button("保存录制").clicked() {
-                            self.stop_recording();
-                        }
-                    });
-                }
-                Some(_) => {
-                    ui.add_enabled(false, egui::Button::new("正在导出…"));
-                }
-                None => {
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(self.streaming, egui::Button::new("开始录制"))
-                            .clicked()
-                        {
-                            self.start_recording();
-                        }
-                        if ui
-                            .add_enabled(!self.data_points.is_empty(), egui::Button::new("导出缓冲区"))
-                            .clicked()
-                        {
-                            self.export_buffer();
-                        }
-                    });
-                }
-            }
-
-            if let Some(recorder) = &self.recorder {
-                ui.label(format!("采样点：{}", recorder.rows));
-                ui.label(format!("插值：{}", recorder.missing_samples));
-                ui.label(format!("丢弃：{}", recorder.discarded_sequence_samples));
-                if self.recording_session {
-                    ui.label(format!(
-                        "录制时长：{}",
-                        format_recording_duration(self.displayed_recording_duration())
-                    ));
-                    ui.label(format!(
-                        "累计能量：{}",
-                        format_cumulative_energy(self.displayed_cumulative_energy_uwh())
-                    ));
-                    ui.label(format!(
-                        "累计容量：{}",
-                        format_capacity(self.displayed_recording_capacity_uah())
-                    ));
-                    ui.label(format!(
-                        "净能量：{}",
-                        EnergyPresentation::for_values([self.displayed_recording_net_energy_uwh()])
-                            .format_directional(self.displayed_recording_net_energy_uwh())
-                    ));
-                }
-                let completeness = if recorder.elapsed_us == 0 {
-                    100.0
-                } else {
-                    (1.0 - recorder.interpolated_duration_us as f64 / recorder.elapsed_us as f64).max(0.0)
-                        * 100.0
-                };
-                ui.label(format!("数据完整度：{completeness:.6}%"));
-            } else if let Some(summary) = &self.last_recording {
-                ui.label(format!("上次录制：{} 个采样点", summary.rows));
-                ui.label(format!("丢弃：{}", summary.discarded_sequence_samples));
-                ui.label(format!(
-                    "录制时长：{}",
-                    format_recording_duration(self.displayed_recording_duration())
-                ));
-                ui.label(format!(
-                    "累计能量：{}",
-                    format_cumulative_energy(self.displayed_cumulative_energy_uwh())
-                ));
-                ui.label(format!(
-                    "累计容量：{}",
-                    format_capacity(self.displayed_recording_capacity_uah())
-                ));
-                ui.label(format!(
-                    "净能量：{}",
-                    EnergyPresentation::for_values([self.displayed_recording_net_energy_uwh()])
-                        .format_directional(self.displayed_recording_net_energy_uwh())
-                ));
-                ui.label(format!("数据完整度：{:.6}%", summary.completeness_percent()));
-            }
-            ui.small(&self.recording_status);
-
-            ui.add_space(20.0);
-            ui.separator();
-            ui.heading("设备离线记录");
-            ui.separator();
-
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(
-                        self.device_state.is_some()
-                            && !self.offline_busy
-                            && self.recorder.is_none()
-                            && self.offline_export.is_none(),
-                        egui::Button::new("刷新目录"),
-                    )
-                    .clicked()
-                {
-                    self.request_offline_catalog();
-                }
-                if self.offline_busy {
-                    ui.spinner();
-                }
-            });
-
-            if !self.offline_catalog.is_empty() {
-                let selected_text = self
-                    .offline_selected
-                    .and_then(|index| self.offline_catalog.get(index))
-                    .map_or_else(|| "选择一条记录".to_string(), |metadata| metadata.filename_lossy().into_owned());
-                egui::ComboBox::from_id_salt("offline_recording")
-                    .selected_text(selected_text)
-                    .show_ui(ui, |ui| {
-                        for (index, metadata) in self.offline_catalog.iter().enumerate() {
-                            ui.selectable_value(
-                                &mut self.offline_selected,
-                                Some(index),
-                                format!(
-                                    "#{} {}（{} 个采样点）",
-                                    index,
-                                    metadata.filename_lossy(),
-                                    metadata.sample_count
-                                ),
-                            );
-                        }
-                    });
-
-                if let Some(metadata) = self
-                    .offline_selected
-                    .and_then(|index| self.offline_catalog.get(index))
-                {
-                    egui::Grid::new("offline_metadata_grid")
-                        .num_columns(2)
-                        .spacing([10.0, 4.0])
-                        .show(ui, |ui| {
-                            ui.label("采样点");
-                            ui.label(metadata.sample_count.to_string());
-                            ui.end_row();
-                            ui.label("间隔");
-                            ui.label(format!("{} ms", metadata.interval.get::<millisecond>()));
-                            ui.end_row();
-                            ui.label("时长");
-                            ui.label(format!("{:.1} s", metadata.recorded_duration.get::<second>()));
-                            ui.end_row();
-                            ui.label("最终电荷");
-                            ui.label(format!("{:.3} mAh", metadata.final_charge.get::<milliampere_hour>()));
-                            ui.end_row();
-                            ui.label("最终能量");
-                            ui.label(format!("{:.3} mWh", metadata.final_energy.get::<milliwatt_hour>()));
-                            ui.end_row();
-                        });
-                }
-
-                if ui
-                    .add_enabled(
-                        self.device_state.is_some()
-                            && self.offline_selected.is_some()
-                            && !self.offline_busy
-                            && self.recorder.is_none()
-                            && self.offline_export.is_none(),
-                        egui::Button::new("下载并查看"),
-                    )
-                    .clicked()
-                {
-                    self.download_selected_offline_log();
-                }
-            }
-
-            if let Some(view) = &self.offline_view {
-                ui.label(format!(
-                    "已载入：{}（{} 个采样点）",
-                    view.log.metadata.filename_lossy(),
-                    view.samples.len()
-                ));
-                let previous_source = self.plot_source;
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.plot_source, PlotSource::Live, "查看实时");
-                    ui.selectable_value(&mut self.plot_source, PlotSource::Offline, "查看离线");
-                });
-                if previous_source != self.plot_source {
-                    self.cursor_readout = None;
-                    self.reset_plots_requested = true;
-                    if self.plot_source == PlotSource::Offline {
-                        self.time_window = TimeWindow::All;
-                        for metric in &mut self.plot_metrics {
-                            if !metric.supports_offline() {
-                                *metric = PlotMetric::Voltage;
-                            }
-                        }
-                    }
-                }
-                ui.add_enabled_ui(self.offline_export.is_none() && self.recorder.is_none(), |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("导出格式");
-                        egui::ComboBox::from_id_salt("offline_recording_format")
-                            .selected_text(self.recording_format.label())
-                            .show_ui(ui, |ui| {
-                                for format in RecordingFormat::ALL {
-                                    ui.selectable_value(&mut self.recording_format, format, format.label());
-                                }
-                            });
-                    });
-                });
-                if let Some(export) = &self.offline_export {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(format!("正在导出 {}", export.path.display()));
-                    });
-                } else if ui.button("导出已下载记录").clicked() {
-                    self.export_offline_log();
-                }
-            }
-            ui.small(&self.offline_status);
-
-            ui.add_space(12.0);
-            ui.separator();
-            ui.collapsing("关于 KM003C 工作台", |ui| {
-                ui.small(format!("版本 v{APP_VERSION}（构建 {APP_BUILD}）"));
-                ui.small("基于开源 km003c-rs，遵循 MIT / Apache-2.0 许可。");
-                ui.small("本软件不是 ChargerLAB 官方软件。");
-                ui.small("日志目录：~/Library/Application Support/com.weixun.km003cworkbench/logs/");
-            });
-
-            ui.add_space(5.0);
-
-            if self.streaming {
-                if ui.button("断开连接").clicked() {
-                    info!("Disconnect requested");
-                    self.disconnect_requested = true;
-                    let _ = self.cmd_sender.send(UsbCommand::Disconnect);
-                }
-            } else if self.device_state.is_none() {
-                ui.checkbox(&mut self.usb_reset, "连接时手动 USB reset（高级）");
-                if ui.button("连接设备").clicked() {
-                    info!("Connect requested");
-                    let _ = self
-                        .cmd_sender
-                        .send(UsbCommand::Connect(self.selected_rate.to_graph_rate(), self.usb_reset));
-                }
-            }
-            });
-
-        });
-
-            // Bottom panel with the combined PD timeline
-            if self.pd_panel_visible {
-                egui::Panel::bottom("pd_panel")
-                    .resizable(true)
-                    .min_size(100.0)
-                    .default_size(200.0)
-                    .show(ui, |ui| {
-                        ui.heading("USB PD 时间线");
-                        if self.pd_trace_enabled {
-                            ui.small("[FW] 时间戳精度为 1 秒；同一秒内与 [WIRE] 报文的先后顺序为近似值。");
-                        }
-                        ui.separator();
-
-                        let text_style = egui::TextStyle::Monospace;
-                        let row_height = ui.text_style_height(&text_style);
-                        let timeline = pd_timeline_entries(
-                            &self.pd_log,
-                            &self.pd_trace_log,
-                            self.pd_protocol_visible,
-                            self.pd_trace_enabled,
-                        );
-
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false; 2])
-                            .stick_to_bottom(self.pd_auto_scroll)
-                            .show(ui, |ui| {
-                                for timeline_entry in timeline {
-                                    match timeline_entry {
-                                        PdTimelineEntry::Protocol(entry) => {
-                                            let color = match entry.category {
-                                                PdCategory::Connect => egui::Color32::GREEN,
-                                                PdCategory::Disconnect => egui::Color32::RED,
-                                                PdCategory::SourceCaps => egui::Color32::from_rgb(100, 149, 237),
-                                                PdCategory::Request => egui::Color32::YELLOW,
-                                                PdCategory::Contract => egui::Color32::LIGHT_GREEN,
-                                                PdCategory::Control => egui::Color32::GRAY,
-                                                PdCategory::Extended => egui::Color32::from_rgb(255, 165, 0),
-                                                PdCategory::Error => egui::Color32::from_rgb(255, 80, 80),
-                                            };
-
-                                            ui.colored_label(
-                                                color,
-                                                egui::RichText::new(format!("[WIRE] {}", entry.summary))
-                                                    .monospace()
-                                                    .size(row_height),
-                                            );
-                                            for detail in &entry.details {
-                                                ui.colored_label(
-                                                    color.gamma_multiply(0.8),
-                                                    egui::RichText::new(format!("       {detail}"))
-                                                        .monospace()
-                                                        .size(row_height),
-                                                );
-                                            }
-                                        }
-                                        PdTimelineEntry::FirmwareTrace(entry) => {
-                                            let color = match entry.category {
-                                                PdTraceCategory::TypeCState => egui::Color32::from_rgb(100, 200, 255),
-                                                PdTraceCategory::ProtocolEvent => egui::Color32::LIGHT_GREEN,
-                                                PdTraceCategory::Unknown => egui::Color32::YELLOW,
-                                            };
-                                            ui.colored_label(
-                                                color,
-                                                egui::RichText::new(format!("[FW]   {}", entry.summary))
-                                                    .monospace()
-                                                    .size(row_height),
-                                            );
-                                        }
-                                    }
-                                }
-                            });
-                    });
-            }
-
-            // Main panel with plots
-            egui::CentralPanel::default().show(ui, |ui| {
-                let current_time = match self.plot_source {
-                    PlotSource::Live => self.data_points.back().map_or(0.0, |sample| sample.elapsed_seconds()),
-                    PlotSource::Offline => self
-                        .offline_view
-                        .as_ref()
-                        .and_then(|view| view.samples.last())
-                        .map_or(0.0, |sample| sample.elapsed_seconds()),
-                };
-                if let Some(readout) = self.cursor_readout.or_else(|| self.cursor_readout_at(current_time)) {
-                    let cursor_is_pinned = self.cursor_readout.is_some();
-                    self.show_cursor_strip(ui, readout, cursor_is_pinned);
-                    if ui
-                        .add_enabled(cursor_is_pinned, egui::Button::new("跟随最新").small())
-                        .clicked()
-                    {
-                        self.cursor_readout = None;
-                        self.reset_plots_requested = true;
-                    }
-                    ui.add_space(4.0);
-                }
-                match self.plot_source {
-                    PlotSource::Live => ui.small("数据源：实时 AdcQueue"),
-                    PlotSource::Offline => {
-                        let filename = self
-                            .offline_view
-                            .as_ref()
-                            .map_or_else(|| "未加载".into(), |view| view.log.metadata.filename_lossy());
-                        ui.small(format!("数据源：设备离线记录 {filename}"))
-                    }
-                };
-                let available_height = ui.available_height();
-                let plot_height = (available_height - 30.0) / 3.0;
-
-                let min_time = self
-                    .time_window
-                    .seconds()
-                    .map(|window| (current_time - window).max(0.0));
-                let max_plot_points = (ui.available_width().max(256.0) * 2.0) as usize;
-
-                let mut next_cursor_time = None;
-                for (index, metric) in self.plot_metrics.into_iter().enumerate() {
-                    ui.label(format!("{} ({})", metric.label(), metric.unit()));
-                    let mut plot = Plot::new(("measurement_plot", index))
-                        .height(plot_height)
-                        .show_axes([true, true])
-                        .show_grid(true)
-                        .link_axis("measurement-axis", [true, false])
-                        .link_cursor("measurement-cursor", [true, false])
-                        .show_crosshair(true)
-                        .allow_boxed_zoom(true)
-                        .allow_drag(true)
-                        .allow_scroll(true);
-                    if self.reset_plots_requested {
-                        plot = plot.reset();
-                    }
-                    let response = plot.show(ui, |plot_ui| {
-                        let raw_points: Vec<[f64; 2]> = match self.plot_source {
-                            PlotSource::Live => self
-                                .data_points
-                                .iter()
-                                .filter(|sample| min_time.is_none_or(|min| sample.elapsed_seconds() >= min))
-                                .map(|sample| [sample.elapsed_seconds(), metric.value(sample)])
-                                .collect(),
-                            PlotSource::Offline => self
-                                .offline_view
-                                .iter()
-                                .flat_map(|view| &view.samples)
-                                .filter(|sample| min_time.is_none_or(|min| sample.elapsed_seconds() >= min))
-                                .filter_map(|sample| {
-                                    sample
-                                        .metric_value(metric)
-                                        .map(|value| [sample.elapsed_seconds(), value])
-                                })
-                                .collect(),
-                        };
-                        let points: PlotPoints = min_max_downsample(raw_points, max_plot_points).into();
-                        plot_ui.line(Line::new(metric.label(), points).color(metric.color()).width(1.6_f32));
-                        plot_ui
-                            .response()
-                            .hovered()
-                            .then(|| plot_ui.pointer_coordinate().map(|point| point.x))
-                            .flatten()
-                    });
-                    if let Some(time) = response.inner {
-                        next_cursor_time = Some(time);
-                        if let Some(readout) = self.cursor_readout_at(time) {
-                            response
-                                .response
-                                .on_hover_ui_at_pointer(|ui| self.show_cursor_table(ui, readout));
-                        }
-                    }
-                }
-                if let Some(time) = next_cursor_time {
-                    self.cursor_readout = self.cursor_readout_at(time);
-                }
-                self.reset_plots_requested = false;
-            });
-        }
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -10052,266 +9187,18 @@ impl eframe::App for PowerMonitorApp {
         // here makes Finder/Command-Q exits flush the 23-column contract.
         self.stop_recording();
         if !self.demo_mode {
-            let _ = self.cmd_sender.send(UsbCommand::Disconnect);
-        }
-    }
-}
-
-async fn usb_streaming_task(tx: mpsc::UnboundedSender<UsbMessage>, mut cmd_rx: mpsc::UnboundedReceiver<UsbCommand>) {
-    info!("USB task started, waiting for Connect command");
-
-    // Main loop - wait for commands
-    loop {
-        // Wait for a command (blocking)
-        let cmd = match cmd_rx.recv().await {
-            Some(cmd) => cmd,
-            None => {
-                warn!("Command channel closed");
-                break;
-            }
-        };
-
-        match cmd {
-            UsbCommand::Connect(initial_rate, usb_reset) => {
-                info!("Connect command received, rate={:?}, reset={}", initial_rate, usb_reset);
-                run_streaming_session(&tx, &mut cmd_rx, initial_rate, usb_reset).await;
-            }
-            UsbCommand::SetSampleRate(_)
-            | UsbCommand::SetPdTraceEnabled(_)
-            | UsbCommand::RequestOfflineCatalog
-            | UsbCommand::DownloadOfflineLog(_)
-            | UsbCommand::Disconnect => {
-                // Ignore these when not connected
-                debug!("Ignoring command while disconnected: {:?}", cmd);
+            // The process exits right after this returns. Give the USB task a
+            // bounded moment to send StopGraph and close the interface, so the
+            // meter is not left streaming and no transfer is still in flight
+            // while AppKit tears the process down.
+            if self.cmd_sender.send(UsbCommand::Disconnect).is_ok()
+                && self.usb_session_active()
+                && !self.wait_for_usb_shutdown(USB_SHUTDOWN_TIMEOUT)
+            {
+                warn!("USB task did not release the device within {USB_SHUTDOWN_TIMEOUT:?}; quitting anyway");
             }
         }
     }
-}
-
-async fn run_streaming_session(
-    tx: &mpsc::UnboundedSender<UsbMessage>,
-    cmd_rx: &mut mpsc::UnboundedReceiver<UsbCommand>,
-    initial_rate: GraphSampleRate,
-    usb_reset: bool,
-) {
-    // Connect to device with vendor interface (Full mode for AdcQueue)
-    let config = if usb_reset {
-        DeviceConfig::vendor()
-    } else {
-        DeviceConfig::vendor().skip_reset()
-    };
-    let mut device = match KM003C::new(config).await {
-        Ok(dev) => dev,
-        Err(e) => {
-            error!("Failed to connect: {}", e);
-            let _ = tx.send(UsbMessage::ConnectionFailed(e.to_string()));
-            return;
-        }
-    };
-
-    // Send device state to UI (always available in Full mode)
-    let state = device.state().expect("device in Full mode");
-    info!("Connected to {} (FW {})", state.model(), state.firmware_version());
-
-    if !state.adcqueue_enabled {
-        error!("AdcQueue not enabled - authentication may have failed");
-        let _ = tx.send(UsbMessage::ConnectionFailed("AdcQueue not enabled".to_string()));
-        return;
-    }
-
-    let _ = tx.send(UsbMessage::Connected(Arc::new(state.clone())));
-
-    // Initial StopGraph to ensure clean state
-    info!("Sending initial StopGraph to ensure clean state");
-    let _ = device.stop_graph_mode().await;
-
-    // Start streaming
-    let mut current_rate = initial_rate;
-    if let Err(e) = start_streaming(&mut device, current_rate, tx).await {
-        error!("Failed to start streaming: {}", e);
-        let _ = tx.send(UsbMessage::Error(format!("Start failed: {}", e)));
-        let _ = tx.send(UsbMessage::Disconnected);
-        return;
-    }
-
-    // Streaming loop - poll for data and handle commands
-    let mut error_count = 0;
-    let mut pd_trace_enabled = false;
-    const MAX_ERRORS: u32 = 10;
-
-    loop {
-        // Check for commands from UI (non-blocking)
-        match cmd_rx.try_recv() {
-            Ok(UsbCommand::SetSampleRate(new_rate)) => {
-                if new_rate != current_rate {
-                    info!("Changing sample rate to {:?}", new_rate);
-
-                    // Stop current streaming
-                    let _ = device.stop_graph_mode().await;
-                    let _ = tx.send(UsbMessage::StreamingStopped);
-
-                    // Start with new rate
-                    if let Err(e) = start_streaming(&mut device, new_rate, tx).await {
-                        error!("Failed to restart streaming: {}", e);
-                        let _ = tx.send(UsbMessage::Error(format!("Restart failed: {}", e)));
-                        continue;
-                    }
-                    current_rate = new_rate;
-                }
-            }
-            Ok(UsbCommand::SetPdTraceEnabled(enabled)) => {
-                pd_trace_enabled = enabled;
-                info!(
-                    "Firmware PD trace collection {}",
-                    if enabled { "enabled" } else { "disabled" }
-                );
-            }
-            Ok(UsbCommand::RequestOfflineCatalog) => {
-                info!("Loading offline recording catalog");
-                if let Err(error) = device.stop_graph_mode().await {
-                    let _ = tx.send(UsbMessage::OfflineOperationFailed(format!(
-                        "Could not pause streaming for offline catalog access: {error}"
-                    )));
-                    continue;
-                }
-                let _ = tx.send(UsbMessage::StreamingStopped);
-                match device.request_log_metadata().await {
-                    Ok(catalog) => {
-                        let _ = tx.send(UsbMessage::OfflineCatalog(catalog));
-                    }
-                    Err(error) => {
-                        let _ = tx.send(UsbMessage::OfflineOperationFailed(format!(
-                            "Failed to load offline catalog: {error}"
-                        )));
-                    }
-                }
-                if let Err(error) = start_streaming(&mut device, current_rate, tx).await {
-                    let _ = tx.send(UsbMessage::Error(format!(
-                        "Failed to resume streaming after loading offline catalog: {error}"
-                    )));
-                    break;
-                }
-            }
-            Ok(UsbCommand::DownloadOfflineLog(metadata)) => {
-                info!(
-                    filename = %metadata.filename_lossy(),
-                    samples = metadata.sample_count,
-                    "Downloading offline recording"
-                );
-                if let Err(error) = device.stop_graph_mode().await {
-                    let _ = tx.send(UsbMessage::OfflineOperationFailed(format!(
-                        "Could not pause streaming for offline download: {error}"
-                    )));
-                    continue;
-                }
-                let _ = tx.send(UsbMessage::StreamingStopped);
-                match device.download_offline_log(metadata).await {
-                    Ok(log) => {
-                        let _ = tx.send(UsbMessage::OfflineLogDownloaded(log));
-                    }
-                    Err(error) => {
-                        let _ = tx.send(UsbMessage::OfflineOperationFailed(format!(
-                            "Failed to download offline recording: {error}"
-                        )));
-                    }
-                }
-                if let Err(error) = start_streaming(&mut device, current_rate, tx).await {
-                    let _ = tx.send(UsbMessage::Error(format!(
-                        "Failed to resume streaming after offline download: {error}"
-                    )));
-                    break;
-                }
-            }
-            Ok(UsbCommand::Disconnect) => {
-                info!("Disconnect command received");
-                break;
-            }
-            Ok(UsbCommand::Connect(..)) => {
-                // Ignore connect while already connected
-                debug!("Ignoring Connect while already streaming");
-            }
-            Err(mpsc::error::TryRecvError::Empty) => {
-                // No command, continue polling
-            }
-            Err(mpsc::error::TryRecvError::Disconnected) => {
-                warn!("Command channel disconnected");
-                break;
-            }
-        }
-
-        // Request the regular streams and the opt-in firmware trace.
-        let mask = streaming_attribute_mask(pd_trace_enabled);
-        match device.request_data(mask).await {
-            Ok(packet) => {
-                error_count = 0;
-
-                if let Some(queue_data) = packet.get_adc_queue()
-                    && !queue_data.samples.is_empty()
-                {
-                    debug!("Received {} samples", queue_data.samples.len());
-                    if tx.send(UsbMessage::Samples(queue_data.samples.clone())).is_err() {
-                        warn!("UI closed, stopping");
-                        break;
-                    }
-                }
-
-                if let Some(stream) = packet.get_pd_events() {
-                    let _ = tx.send(UsbMessage::PdStatusUpdate(stream.preamble));
-                    let _ = tx.send(UsbMessage::PdEvents(stream.events.clone()));
-                }
-                if let Some(status) = packet.get_pd_status() {
-                    let _ = tx.send(UsbMessage::PdStatusUpdate(*status));
-                }
-                if let Some(trace) = packet.get_pd_trace()
-                    && (!trace.state_events.is_empty() || !trace.protocol_events.is_empty())
-                {
-                    let _ = tx.send(UsbMessage::PdTrace(trace.clone()));
-                }
-            }
-            Err(e) => {
-                error_count += 1;
-                debug!("Request error: {}", e);
-                if error_count >= MAX_ERRORS {
-                    let _ = tx.send(UsbMessage::Error("Too many errors".to_string()));
-                    break;
-                }
-            }
-        }
-
-        // Small delay between requests - adjust based on sample rate
-        let delay_ms = match current_rate {
-            GraphSampleRate::Sps2 => 200,  // 5 requests/sec for 2 SPS
-            GraphSampleRate::Sps10 => 50,  // 20 requests/sec for 10 SPS
-            GraphSampleRate::Sps50 => 20,  // 50 requests/sec for 50 SPS
-            GraphSampleRate::Sps1000 => 5, // 200 requests/sec for 1000 SPS
-        };
-        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-    }
-
-    // Stop streaming and disconnect
-    info!("Stopping streaming");
-    let _ = device.stop_graph_mode().await;
-    let _ = tx.send(UsbMessage::Disconnected);
-}
-
-fn streaming_attribute_mask(pd_trace_enabled: bool) -> AttributeSet {
-    let mask = AttributeSet::single(Attribute::AdcQueue).with(Attribute::PdPacket);
-    if pd_trace_enabled {
-        mask.with(Attribute::PdTrace)
-    } else {
-        mask
-    }
-}
-
-async fn start_streaming(
-    device: &mut KM003C,
-    rate: GraphSampleRate,
-    tx: &mpsc::UnboundedSender<UsbMessage>,
-) -> Result<(), km003c_lib::error::KMError> {
-    info!("Starting AdcQueue streaming at {:?}", rate);
-    device.start_graph_mode(rate).await?;
-    let _ = tx.send(UsbMessage::StreamingStarted(rate));
-    Ok(())
 }
 
 const DEMO_APP_ID: &str = "com.weixun.km003cworkbench.demo";
@@ -10333,6 +9220,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let demo_mode = std::env::args().any(|arg| arg == "--demo");
     let runtime_app_id =
         std::env::var("KM003C_NATIVE_APP_ID").unwrap_or_else(|_| default_runtime_app_id(demo_mode).to_string());
+    let _ = RUNTIME_APP_ID.set(runtime_app_id.clone());
     let runtime_title =
         std::env::var("KM003C_WINDOW_TITLE").unwrap_or_else(|_| default_runtime_title(demo_mode).to_string());
     let Some(single_instance_guard) = SingleInstanceGuard::acquire(&runtime_app_id)? else {
@@ -10340,7 +9228,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // existing UI consumes it on the next frame and focuses its viewport.
         return Ok(());
     };
-    init_logging(&runtime_app_id);
+    logging::init(&runtime_app_id);
     info!(demo_mode, "Starting KM003C Workbench");
 
     // Create channels for communication
@@ -10360,7 +9248,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(icon) = icon {
         viewport = viewport.with_icon(icon);
     }
-    let options = eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
         persist_window: true,
         // `persistence_path` is a file, while `storage_dir` is the directory
         // shared by logs and recoverable recordings. Passing the directory
@@ -10372,6 +9260,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         viewport,
         ..Default::default()
     };
+    prefer_low_power_gpu(&mut options);
 
     eframe::run_native(
         &runtime_title,
@@ -10389,22 +9278,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
 }
 
-fn init_logging(runtime_app_id: &str) {
-    let log_dir = std::env::var_os("KM003C_STORAGE_ROOT")
-        .map(PathBuf::from)
-        .or_else(|| eframe::storage_dir(runtime_app_id))
-        .map(|path| path.join("logs"));
-    if let Some(log_dir) = log_dir
-        && std::fs::create_dir_all(&log_dir).is_ok()
-        && let Ok(file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_dir.join("session.log"))
+/// egui-wgpu requests a `HighPerformance` adapter by default. On dual-GPU
+/// Intel MacBook Pros that keeps the discrete GPU powered for as long as the
+/// workbench is open, although plotting never needs it. Prefer the integrated
+/// GPU unless `WGPU_POWER_PREF` says otherwise; single-GPU Macs are unaffected.
+fn prefer_low_power_gpu(options: &mut eframe::NativeOptions) {
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup
+        && eframe::wgpu::PowerPreference::from_env().is_none()
     {
-        tracing_subscriber::fmt().with_writer(file).with_ansi(false).init();
-        return;
+        setup.power_preference = eframe::wgpu::PowerPreference::LowPower;
     }
-    tracing_subscriber::fmt().with_ansi(false).init();
 }
 
 /// Return the source UV rectangle needed to cover a viewport without
@@ -10428,6 +9311,8 @@ fn wallpaper_uv(texture_size: egui::Vec2, viewport_size: egui::Vec2) -> egui::Re
 mod tests {
     use super::*;
     use crate::offline_view::captured_test_view;
+    use crate::usb_task::streaming_attribute_mask;
+    use km003c_lib::{AdcQueueSample, packet::Attribute};
     use polars::prelude::{CsvReader, ParquetReader, SerReader};
 
     #[test]
@@ -11364,6 +10249,78 @@ mod tests {
     }
 
     #[test]
+    fn native_options_prefer_the_integrated_gpu() {
+        if eframe::wgpu::PowerPreference::from_env().is_some() {
+            return; // An explicit WGPU_POWER_PREF intentionally wins.
+        }
+        let mut options = eframe::NativeOptions::default();
+        prefer_low_power_gpu(&mut options);
+        let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &options.wgpu_options.wgpu_setup else {
+            panic!("eframe's default wgpu setup creates its own device");
+        };
+        assert_eq!(setup.power_preference, eframe::wgpu::PowerPreference::LowPower);
+    }
+
+    #[test]
+    fn quitting_waits_until_the_usb_task_releases_the_device() {
+        let (usb_tx, usb_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let mut app = PowerMonitorApp::new(usb_rx, cmd_tx);
+        app.streaming = true;
+        app.phase = ConnectionPhase::Streaming;
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let usb_task = {
+            let released = Arc::clone(&released);
+            std::thread::spawn(move || {
+                while let Some(command) = cmd_rx.blocking_recv() {
+                    if matches!(command, UsbCommand::Disconnect) {
+                        break;
+                    }
+                }
+                // StopGraph and interface release take a moment; late
+                // samples may still be queued ahead of the confirmation.
+                std::thread::sleep(Duration::from_millis(50));
+                let _ = usb_tx.send(UsbMessage::Samples(Vec::new()));
+                released.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = usb_tx.send(UsbMessage::Disconnected);
+            })
+        };
+
+        eframe::App::on_exit(&mut app);
+
+        assert!(
+            released.load(std::sync::atomic::Ordering::SeqCst),
+            "on_exit returned before the USB task released the device"
+        );
+        usb_task.join().unwrap();
+    }
+
+    #[test]
+    fn quitting_without_a_device_session_does_not_wait() {
+        let (_usb_tx, usb_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let mut app = PowerMonitorApp::new(usb_rx, cmd_tx);
+        app.phase = ConnectionPhase::NoDevice;
+
+        let started = Instant::now();
+        eframe::App::on_exit(&mut app);
+
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(matches!(cmd_rx.try_recv(), Ok(UsbCommand::Disconnect)));
+    }
+
+    #[test]
+    fn usb_shutdown_wait_is_bounded_when_the_task_never_answers() {
+        let (_usb_tx, usb_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let mut app = PowerMonitorApp::new(usb_rx, cmd_tx);
+
+        let started = Instant::now();
+        assert!(!app.wait_for_usb_shutdown(Duration::from_millis(30)));
+        assert!(started.elapsed() >= Duration::from_millis(30));
+    }
+
+    #[test]
     fn standby_readouts_are_unknown_until_a_real_sample_arrives() {
         let (usb_tx, usb_rx) = mpsc::unbounded_channel();
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
@@ -11433,24 +10390,25 @@ mod tests {
         assert!(default_runtime_title(true).contains("演示模式"));
     }
 
-    #[cfg(unix)]
     #[test]
-    fn second_instance_notifies_the_primary_without_taking_the_lock() {
-        let unique_id = format!(
-            "{APP_ID}.test.{}.{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+    fn demo_recordings_stay_out_of_the_real_app_storage() {
+        let home = || Some(std::ffi::OsString::from("/Users/someone"));
+        let real = recordings_directory_for(APP_ID, None, home());
+        let demo = recordings_directory_for(DEMO_APP_ID, None, home());
+        assert_eq!(
+            real,
+            Path::new("/Users/someone/Library/Application Support/com.weixun.km003cworkbench/Recordings")
         );
-        let (lock_path, activation_path) = instance_lock_paths(&unique_id);
-        let primary = SingleInstanceGuard::acquire(&unique_id).unwrap().unwrap();
-        assert!(SingleInstanceGuard::acquire(&unique_id).unwrap().is_none());
-        assert!(primary.activation_requested());
-        drop(primary);
-        assert!(!lock_path.exists());
-        assert!(!activation_path.exists());
+        assert!(
+            !demo.starts_with(real.parent().unwrap()),
+            "demo recordings must not land in, or be recovered from, {}",
+            real.display()
+        );
+        assert_eq!(
+            recordings_directory_for(DEMO_APP_ID, Some("/tmp/km003c-root".into()), home()),
+            Path::new("/tmp/km003c-root/Recordings"),
+            "KM003C_STORAGE_ROOT still decides for every app id"
+        );
     }
 
     #[test]
@@ -11621,6 +10579,163 @@ mod tests {
             last.energy_throughput_uwh,
             last.charge_throughput_uah
         );
+    }
+
+    #[test]
+    fn logic_wakes_at_the_pace_of_the_stream() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let mut app = PowerMonitorApp::new(rx, cmd_tx);
+        assert!(!app.demo_mode);
+
+        app.streaming = false;
+        assert_eq!(app.next_logic_delay(false), IDLE_REPAINT_INTERVAL);
+        assert_eq!(
+            app.next_logic_delay(true),
+            Duration::ZERO,
+            "a USB backlog is drained on the next pass"
+        );
+
+        app.streaming = true;
+        let mut slower = Duration::MAX;
+        for &rate in SampleRateOption::all() {
+            app.current_rate = rate;
+            let interval = app.next_logic_delay(false);
+            assert!(
+                interval <= IDLE_REPAINT_INTERVAL,
+                "{rate:?}: the 0.1 s recording clock keeps moving"
+            );
+            assert!(interval < slower, "{rate:?}: faster streams are drawn more often");
+            slower = interval;
+            assert_eq!(app.next_logic_delay(true), Duration::ZERO);
+        }
+        assert_eq!(
+            SampleRateOption::Sps1000.streaming_repaint_interval(),
+            FRAME_REPAINT_INTERVAL
+        );
+
+        app.demo_mode = true;
+        app.current_rate = SampleRateOption::Sps2;
+        assert_eq!(
+            app.next_logic_delay(false),
+            FRAME_REPAINT_INTERVAL,
+            "the demo generator advances once per pass"
+        );
+        app.streaming = false;
+        assert_eq!(app.next_logic_delay(false), IDLE_REPAINT_INTERVAL);
+    }
+
+    #[test]
+    fn stalled_stream_preserves_interruptions_and_manual_pause_when_saved() {
+        use km003c_lib::uom::si::{
+            electric_current::ampere,
+            f64::{ElectricCurrent, ElectricPotential},
+        };
+        for format in RecordingFormat::ALL {
+            for (manual_pause, restart_success) in [(false, true), (true, true), (false, false)] {
+                let (tx, rx) = mpsc::unbounded_channel();
+                let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+                let mut app = PowerMonitorApp::new(rx, cmd_tx);
+                app.sleep_protection_enabled = false;
+                let root = std::env::temp_dir().join(format!(
+                    "km003c-stall-{}-{}",
+                    std::process::id(),
+                    Utc::now().timestamp_nanos_opt().unwrap()
+                ));
+                let directory = root.join("session");
+                std::fs::create_dir_all(directory.join("segments")).unwrap();
+                let metadata = RecordingSessionMetadataV1::new(
+                    Utc::now() - chrono::Duration::seconds(10),
+                    RecordingMetadata::default(),
+                    2,
+                );
+                app.recording_session_directory = Some(directory.clone());
+                app.recording_manifest = Some(RecordingSessionManifestV1::new(format, metadata.clone()));
+                app.recording_session_metadata = Some(metadata);
+                app.recording_session = true;
+                app.recording_phase = RecordingPhase::Recording;
+                app.start_next_recording_segment(None, RecordingOffsets::default())
+                    .unwrap();
+                let sample = |sequence| {
+                    let vbus = ElectricPotential::new::<volt>(10.0);
+                    let ibus = ElectricCurrent::new::<ampere>(2.0);
+                    AdcQueueSample {
+                        sequence,
+                        marker: 0,
+                        vbus,
+                        ibus,
+                        power: vbus * ibus,
+                        cc1: vbus,
+                        cc2: vbus,
+                        vdp: vbus,
+                        vdm: vbus,
+                    }
+                };
+                tx.send(UsbMessage::StreamingStarted(GraphSampleRate::Sps2)).unwrap();
+                tx.send(UsbMessage::Samples(vec![sample(0), sample(500)])).unwrap();
+                app.process_messages();
+                if manual_pause {
+                    app.pause_recording();
+                }
+                tx.send(UsbMessage::StreamingStalled(
+                    Instant::now() - Duration::from_millis(3500),
+                ))
+                .unwrap();
+                tx.send(UsbMessage::StreamingStopped).unwrap();
+                if restart_success {
+                    tx.send(UsbMessage::StreamingStarted(GraphSampleRate::Sps2)).unwrap();
+                    tx.send(UsbMessage::Samples(vec![sample(4000), sample(4500)])).unwrap();
+                } else {
+                    tx.send(UsbMessage::Disconnected).unwrap();
+                }
+                app.process_messages();
+                if manual_pause {
+                    assert_eq!(app.recording_phase, RecordingPhase::Paused);
+                    assert_eq!(app.pause_reason, Some(PauseReason::Manual));
+                } else if restart_success {
+                    assert_eq!(app.recording_phase, RecordingPhase::Recording);
+                } else {
+                    assert_eq!(app.recording_phase, RecordingPhase::WaitingForReconnect);
+                    assert_eq!(app.pause_reason, Some(PauseReason::UsbDisconnected));
+                }
+                app.stop_recording();
+                let destination = root.join(format!("export.{}", format.extension()));
+                app.pending_save_destination = Some(destination.clone());
+                app.recording_phase = RecordingPhase::Finalizing;
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while app.recording_phase != RecordingPhase::Saved && Instant::now() < deadline {
+                    app.poll_recording();
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert_eq!(app.recording_phase, RecordingPhase::Saved, "{}", app.recording_status);
+                let imported = recording_import::load_recording(&destination).unwrap();
+                let saved = imported.metadata.as_ref().unwrap();
+                let expected_seconds = if restart_success && !manual_pause { 1.0 } else { 0.5 };
+                assert_eq!(imported.samples.len(), if expected_seconds == 1.0 { 4 } else { 2 });
+                assert_eq!(saved.effective_duration_us, (expected_seconds * 1e6) as u64);
+                assert!((saved.cumulative_energy_uwh - 20.0 * expected_seconds / 3600.0 * 1e6).abs() < 0.01);
+                // No samples or energy are fabricated for the unknown interval.
+                assert_eq!(saved.missing_samples, 0);
+                if manual_pause {
+                    assert!(saved.disconnect_intervals.is_empty());
+                    assert_eq!(saved.pause_intervals.len(), 1);
+                } else {
+                    assert_eq!(saved.disconnect_intervals.len(), 1);
+                    assert!(saved.disconnected_duration_ms >= 3500);
+                    assert!(saved.disconnect_intervals[0].ended_at_utc.is_some());
+                    assert_eq!(saved.disconnect_intervals[0].reason, IntervalReason::UsbDisconnected);
+                    assert!(app.recording_status.contains("采集中断"));
+                }
+                assert!(
+                    saved
+                        .pause_intervals
+                        .iter()
+                        .all(|interval| interval.ended_at_utc.is_some())
+                );
+                drop(app);
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
     }
 
     #[test]

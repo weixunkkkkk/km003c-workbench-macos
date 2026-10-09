@@ -63,8 +63,18 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets --all-features --locked
+      # macOS is the workbench's release platform and has its own code paths
+      # (NSProcessInfo activities checked against pmset). Test and lint them
+      # there too. Default features only: the python feature links a pyo3
+      # extension module, which cannot link into a macOS test binary.
+      - if: runner.os == 'macOS'
+        run: cargo test --workspace --all-targets --locked
+      - if: runner.os == 'macOS'
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   python:
     name: Python bindings

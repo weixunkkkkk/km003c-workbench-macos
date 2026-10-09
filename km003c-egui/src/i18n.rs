@@ -163,3 +163,28 @@ pub(crate) fn connection_guidance(
         ConnectionPhase::Streaming => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `<string>` value that follows `<key>{key}</key>` in the bundle plist.
+    fn info_plist_value(key: &str) -> &'static str {
+        let plist = include_str!("../../Distribution/Info.plist");
+        let entry = &plist[plist
+            .find(&format!("<key>{key}</key>"))
+            .unwrap_or_else(|| panic!("Info.plist has no {key}"))..];
+        let value = &entry[entry.find("<string>").expect("string value") + "<string>".len()..];
+        &value[..value.find("</string>").expect("closed string value")]
+    }
+
+    /// Distribution/Info.plist drives the packaging scripts and release tags;
+    /// the About page must report the same identity.
+    #[test]
+    fn about_page_identity_matches_the_bundle_info_plist() {
+        assert_eq!(APP_VERSION, info_plist_value("CFBundleShortVersionString"));
+        assert_eq!(APP_BUILD, info_plist_value("CFBundleVersion"));
+        assert_eq!(APP_ID, info_plist_value("CFBundleIdentifier"));
+        assert_eq!(APP_TITLE, info_plist_value("CFBundleName"));
+    }
+}
