@@ -11,7 +11,16 @@ Rust/egui 提供适合长时间采样的中文仪表界面。
 > [WITRN-RS](https://github.com/KHWLGH/WITRN-RS) 交互思路；没有复制其源代码或
 > 受 GPL-3.0 保护的实现。
 
-当前 macOS 发布版：[`v0.1.0-20261004`](https://github.com/weixunkkkkk/km003c-workbench-macos/releases/tag/v0.1.0-20261004)，App `0.1.0 (5)`。日期标签和同日构建序号用于区分同一 App 版本下的修订包，不改变 CSV/Parquet 数据契约。
+当前 macOS 发布版：[`v0.1.0-20261009`](https://github.com/weixunkkkkk/km003c-workbench-macos/releases/tag/v0.1.0-20261009)，App `0.1.0 (7)`。日期标签和同日构建序号用于区分同一 App 版本下的修订包，不改变 CSV/Parquet 数据契约。
+
+## 2026-10-09 修订
+
+- 整合 PR #15 的后台活动、停流恢复、分段保存时序和有界退出修订。
+- 仪表栏支持折叠，多标尺可比较 U/I/P/E/Q 同时刻读数及差值。
+- 兼容已提供的 laPower 工程 CSV 格式，派生累计量和未知质量明确标注；不跨分段空档积分。
+- 图表范围、标尺、固定游标统一高度；累计数字、单位和方向箭头分列；设置语言下拉框不再铺满控件列。
+- 本次 macOS DMG 与本地已安装并验证的 build 7 相同，旧版发布保留供回退。
+- [完整更新说明、校验值与验证边界](docs/RELEASE-NOTES-2026-10-09.md)。
 
 ## 2026-10-04 修订
 
@@ -63,7 +72,7 @@ Rust/egui 提供适合长时间采样的中文仪表界面。
 
 ### 使用 DMG
 
-从 [GitHub Releases](https://github.com/weixunkkkkk/km003c-workbench-macos/releases/tag/v0.1.0-20261004) 下载 Universal DMG，将“KM003C 工作台.app”拖到“应用程序”。当前版本使用 ad-hoc 签名、尚未进行 Developer ID 公证；首次打开时如果 macOS 显示安全提示，请在 Finder 中右键应用并选择“打开”。
+从 [GitHub Releases](https://github.com/weixunkkkkk/km003c-workbench-macos/releases/tag/v0.1.0-20261009) 下载 Universal DMG，将“KM003C 工作台.app”拖到“应用程序”。当前版本使用 ad-hoc 签名、尚未进行 Developer ID 公证；首次打开时如果 macOS 显示安全提示，请在 Finder 中右键应用并选择“打开”。
 
 ### 从源码运行
 

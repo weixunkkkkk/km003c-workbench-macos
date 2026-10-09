@@ -12,10 +12,24 @@
 </p>
 
 The latest macOS application revision is
-[`v0.1.0-20261004`](https://github.com/weixunkkkkk/km003c-workbench-macos/releases/tag/v0.1.0-20261004).
-It keeps App version `0.1.0 (5)` while using a date-suffixed tag and an optional
+[`v0.1.0-20261009`](https://github.com/weixunkkkkk/km003c-workbench-macos/releases/tag/v0.1.0-20261009).
+It keeps App version `0.1.0 (7)` while using a date-suffixed tag and an optional
 same-day build number to distinguish packaged revisions; the KM003C 23-column
 recording contract is unchanged.
+
+### October 9, 2026 revision
+
+- Includes PR #15's background activity, stalled-stream recovery, segment-save
+  ordering, and bounded shutdown changes.
+- Foldable instrument rail and multiple linked rulers with U/I/P/E/Q readings.
+- Imports the supplied laPower engineering CSV format; derived accumulators
+  and unknown data quality are explicit, and segment gaps are not integrated.
+- Equal-height chart controls, fixed cumulative-value columns, and a compact
+  settings language dropdown.
+- The uploaded macOS DMG is the same build 7 package installed and checked locally.
+
+See the [Chinese release notes](docs/RELEASE-NOTES-2026-10-09.md) for checksums,
+installation, rollback, and unverified hardware cases.
 
 ### October 4, 2026 revision
 
