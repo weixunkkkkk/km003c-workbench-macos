@@ -1,8 +1,10 @@
 name: Release
 
 # Tag push (v*) builds km003c-egui for every supported desktop platform and
-# attaches the archives to a GitHub Release. workflow_dispatch performs the
-# same builds for verification without publishing a release.
+# attaches the packages to a GitHub Release: a tarball for Linux, a zip for
+# Windows and the ad-hoc signed universal DMG from Scripts/build_release.sh
+# for macOS. workflow_dispatch performs the same builds for verification
+# without publishing a release.
 on:
   push:
     tags: ["v*"]
@@ -62,7 +64,7 @@ jobs:
           - os: macos-latest
             platform: macos-universal
             target: universal-apple-darwin
-            archive: tar.gz
+            archive: dmg
 
     steps:
       - uses: actions/checkout@v7
@@ -78,27 +80,23 @@ jobs:
           key: release-${{ matrix.platform }}
 
       - name: Build release binary
-        if: matrix.platform != 'macos-universal'
+        if: runner.os != 'macOS'
         shell: bash
         run: |
           rustup target add "${{ matrix.target }}"
           cargo build --release --locked -p km003c-egui --target "${{ matrix.target }}"
 
-      - name: Build universal macOS binary
-        if: matrix.platform == 'macos-universal'
+      # A bare executable in a tarball is not a Mac app: no Info.plist, bundle
+      # ID, icon or signature, and Finder opens it in Terminal. Build the same
+      # ad-hoc signed universal .app and DMG as a local release, then mount and
+      # verify it.
+      - name: Build, sign and verify the universal app and DMG
+        if: runner.os == 'macOS'
         shell: bash
-        run: |
-          rustup target add x86_64-apple-darwin aarch64-apple-darwin
-          cargo build --release --locked -p km003c-egui --target x86_64-apple-darwin
-          cargo build --release --locked -p km003c-egui --target aarch64-apple-darwin
-          mkdir -p "target/${{ matrix.target }}/release"
-          lipo -create \
-            target/x86_64-apple-darwin/release/KM003CWorkbench \
-            target/aarch64-apple-darwin/release/KM003CWorkbench \
-            -output "target/${{ matrix.target }}/release/KM003CWorkbench"
+        run: ./Scripts/build_release.sh
 
-      - name: Package Unix archive
-        if: runner.os != 'Windows'
+      - name: Package Linux archive
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           name="km003c-egui-v${{ needs.validate.outputs.version }}-${{ matrix.platform }}"
@@ -140,7 +138,7 @@ jobs:
 
       - name: Generate checksums
         working-directory: release-assets
-        run: sha256sum km003c-egui-* > SHA256SUMS
+        run: sha256sum -- *.tar.gz *.zip *.dmg > SHA256SUMS
 
       - uses: softprops/action-gh-release@v3
         with:

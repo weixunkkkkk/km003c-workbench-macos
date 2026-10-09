@@ -2,15 +2,14 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=Scripts/app_version.sh
+source "$ROOT_DIR/Scripts/app_version.sh"
 DIST_DIR="${DIST_DIR:-$ROOT_DIR/dist}"
 BUILD_DIR="$DIST_DIR/build"
-APP_NAME="KM003C 工作台.app"
 APP_DIR="$DIST_DIR/$APP_NAME"
 APP_CONTENTS="$APP_DIR/Contents"
 APP_BINARY="$APP_CONTENTS/MacOS/KM003CWorkbench"
 
-APP_VERSION="${APP_VERSION:-0.1.0}"
-APP_BUILD="${APP_BUILD:-5}"
 SIGNING_MODE="${SIGNING_MODE:-adhoc}"
 SIGNING_IDENTITY="${SIGNING_IDENTITY:-}"
 
@@ -34,16 +33,15 @@ rust_target_for() {
   esac
 }
 
-for arch in arm64 x86_64; do
+slices=()
+for arch in $ARCHS; do
   target="$(rust_target_for "$arch")"
   rustup target add "$target"
   cargo build --release --locked -p km003c-egui --target "$target"
+  slices+=("$CARGO_TARGET_DIR/$target/release/KM003CWorkbench")
 done
 
-lipo -create \
-  "$CARGO_TARGET_DIR/$(rust_target_for arm64)/release/KM003CWorkbench" \
-  "$CARGO_TARGET_DIR/$(rust_target_for x86_64)/release/KM003CWorkbench" \
-  -output "$APP_BINARY"
+lipo -create "${slices[@]}" -output "$APP_BINARY"
 chmod 755 "$APP_BINARY"
 
 ICON_MASTER="$ROOT_DIR/assets/app-icon-master.png"

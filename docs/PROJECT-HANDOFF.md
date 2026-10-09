@@ -69,7 +69,10 @@ d60b87cac14e246445c6c7f630e74fee252379a5ad53e871b6760750e60a1d87
 | --- | --- |
 | `km003c-lib/` | USB 通信、设备协议、PD 底层解码 |
 | `km003c-cli/` | 命令行工具 |
-| `km003c-egui/src/main.rs` | App 状态、USB 任务、录制协调、图表、设置、快捷键；仍是较大文件 |
+| `km003c-egui/src/main.rs` | App 状态、录制协调、图表、设置、快捷键；仍是较大文件 |
+| `usb_task.rs` | USB 会话任务：连接、AdcQueue 采样、PD 事件、固件 trace、停滞检测与重启、`UsbCommand`/`UsbMessage` |
+| `single_instance.rs` | 按 bundle id 的单实例锁（`flock`），第二次启动只唤醒已运行的窗口 |
+| `logging.rs` | `session.log` 初始化、启动时超过 4 MiB 轮转为 `session.log.1`、panic 写入日志（含线程与 backtrace） |
 | `measurement.rs` | 设备序号连续性、缺失统计、梯形积分、有符号与绝对累计量 |
 | `recording.rs` | 后台写盘、23 列数据、写盘事件与汇总 |
 | `recording_session.rs` | manifest、分段合并、北京时间元数据、恢复发现 |
@@ -77,12 +80,12 @@ d60b87cac14e246445c6c7f630e74fee252379a5ad53e871b6760750e60a1d87
 | `offline_view.rs` / `offline_export.rs` | 设备离线数据转换与导出 |
 | `pd_decoder.rs` / `pd_connection.rs` / `pd_trace_view.rs` | 当前合同、连接状态及固件 trace 展示 |
 | `preferences.rs` / `i18n.rs` / `theme.rs` | 持久化偏好、中英文文案及动态主题 |
-| `sleep_assertion.rs` | 录制期间通过 `caffeinate -i` 防止空闲睡眠 |
+| `sleep_assertion.rs` | 进程内 `NSProcessInfo` activity：录制期间防空闲睡眠（等同 `caffeinate -i`），采样期间退出 App Nap；进程退出时由系统自动回收 |
 | `assets/` | 嵌入的应用图标、日系壁纸等素材 |
 
 运行路径：USB 任务 → `UsbMessage` → `App::logic` → `update_runtime` → `process_messages` → 积分及录制提交 → 后台写盘事件。`App::ui` 调用 `show_workbench` 绘制。
 
-**后台处理必须保留在 `App::logic`。** 不得把采样消费、封口轮询、自动控制、重连或下一轮调度移回绘制函数。当前调度为采样时 16ms、空闲 100ms、积压立即重调度，每轮最多处理 64 条 USB 消息。
+**后台处理必须保留在 `App::logic`。** 不得把采样消费、封口轮询、自动控制、重连或下一轮调度移回绘制函数。当前调度按实际采样率：2 SPS 100ms、10 SPS 50ms、50 SPS 33ms、1000 SPS 与演示模式 16ms；未采样时 100ms；积压立即重调度，每轮最多处理 64 条 USB 消息。egui 会从请求的延迟里扣掉一帧预测时间（1/60 s），所以 16ms 等于每个显示帧都跑。USB 任务不会主动唤醒 UI，这个间隔同时也是新样本上屏的最大等待。
 
 ## 状态与数据约定
 
@@ -137,11 +140,13 @@ python3 -m unittest discover -s Scripts -p test_release_version.py
 ./Scripts/build_release.sh
 ```
 
-`build_release.sh` 依次执行 `package_app.sh`、`make_dmg.sh`、`verify_dmg.sh`。构建需要 Rust（当前 Cargo 声明最低 1.97）、Xcode 命令行工具以及两个 macOS Rust target。产物在 `dist/`。
+`build_release.sh` 依次执行 `package_app.sh`、`make_dmg.sh`、`verify_dmg.sh`。构建需要 Rust（当前 Cargo 声明最低 1.97）、Xcode 命令行工具以及两个 macOS Rust target。产物在 `dist/`。本机快速验证可用 `ARCHS=arm64 ./Scripts/build_release.sh`，只编 Apple Silicon，DMG 名以 `-macOS-arm64.dmg` 结尾，不能当作 Universal 发布包。
 
-发布标签从 `Distribution/Info.plist` 的 App 版本校验，支持 `v0.1.0`、`v0.1.0-YYYYMMDD` 和同日构建序号 `v0.1.0-YYYYMMDD-N`。不能拿 workspace 的 `0.3.0` 校验应用标签。当前 DMG 名称仍固定含 `v0.1.0`；以后升级 App 版本时检查 plist、打包脚本和文件名的一致性。
+DMG 的创建与挂载经 `Scripts/disk_image.sh`：macOS 26 起 `hdiutil create` / `attach` 已弃用，有 `diskutil image` 时改用它，较早的系统与 CI runner 自动回退 `hdiutil`；`hdiutil verify` 未弃用，两条路径都用它校验。`DISK_IMAGE_TOOL=hdiutil` 可在新系统上强制走回退路径。
 
-GitHub workflow 构建的是跨平台二进制压缩包，标签触发时生成草稿 Release；手动触发只验证、不发布。macOS App/DMG 由本地脚本生成，不能将 CI 的 tar.gz 当作 DMG。
+App 版本、构建号、Bundle ID 和最低系统版本只在 `Distribution/Info.plist` 维护：打包脚本经 `Scripts/app_version.sh` 读取它并生成 DMG 文件名，`verify_dmg.sh` 校验包内 plist 与之一致，`i18n.rs` 的关于页常量由单元测试比对。发布标签同样从这里校验，支持 `v0.1.0`、`v0.1.0-YYYYMMDD` 和同日构建序号 `v0.1.0-YYYYMMDD-N`。不能拿 workspace 的 `0.3.0` 校验应用标签。
+
+GitHub Release workflow 在 macOS 上调用同一个 `build_release.sh`，产出 ad-hoc 签名的 Universal DMG 并挂载校验；Linux 与 Windows 仍为二进制压缩包。标签触发时生成草稿 Release；手动触发只验证、不发布。
 
 安装前检查应用是否正在录制，先保存或安全封口、正常退出，再备份并替换 `/Applications/KM003C 工作台.app`。保留用户配置和 Pending 目录。安装后核对 binary hash、Universal 架构、签名、实际启动；不要仅用版本号判断新旧，因为此前多次修订沿用 `0.1.0 (1)`。
 
