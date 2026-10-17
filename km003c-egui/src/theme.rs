@@ -463,6 +463,14 @@ mod tests {
     /// Labels the workbench shows in its default Simplified Chinese UI.
     const CHINESE_SAMPLE: &str = "工作台电压电流功率录制设置";
 
+    /// Runs one empty pass so pending font changes apply. The texture delta
+    /// is cleared because no renderer consumes it in tests; egui 0.36 panics
+    /// when an unapplied delta is dropped.
+    fn run_empty_frame(ctx: &egui::Context) {
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_| {});
+        output.textures_delta.clear();
+    }
+
     /// The characters of `text` that the `font_id` stack cannot draw.
     ///
     /// `has_glyph` is not used: egui answers it by comparing the owning face
@@ -471,7 +479,7 @@ mod tests {
     /// resolves to the replacement face without a glyph and has zero width.
     fn missing_glyphs(ctx: &egui::Context, font_id: &egui::FontId, text: &str) -> String {
         // Pending font changes are applied at the start of the next pass.
-        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+        run_empty_frame(ctx);
         ctx.fonts_mut(|fonts| {
             text.chars()
                 .filter(|&c| c != ' ' && fonts.glyph_width(font_id, c) <= 0.0)
@@ -522,7 +530,7 @@ mod tests {
 
         let ctx = egui::Context::default();
         install_fonts(&ctx);
-        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+        run_empty_frame(&ctx);
         let text: String = characters.into_iter().collect();
         for font_id in [egui::FontId::proportional(13.0), egui::FontId::monospace(13.0)] {
             let missing = missing_glyphs(&ctx, &font_id, &text);
@@ -536,7 +544,7 @@ mod tests {
     fn monospace_readout_characters_share_one_advance() {
         let ctx = egui::Context::default();
         install_fonts(&ctx);
-        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+        run_empty_frame(&ctx);
         let font_id = egui::FontId::monospace(34.0);
         let widths: Vec<(char, f32)> = ctx.fonts_mut(|fonts| {
             "0123456789.-+ "
@@ -587,7 +595,7 @@ mod tests {
     fn chinese_latin_and_symbol_labels_rasterize() {
         let ctx = egui::Context::default();
         install_fonts(&ctx);
-        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+        run_empty_frame(&ctx);
         let text = format!("{CHINESE_SAMPLE} Voltage 12.345 V · ● Ⅱ ↓ ┄");
         for font_id in [egui::FontId::proportional(13.0), egui::FontId::monospace(13.0)] {
             let galley =
@@ -614,7 +622,7 @@ mod tests {
     fn fallback_symbols_and_chinese_share_the_text_baseline() {
         let ctx = egui::Context::default();
         install_fonts(&ctx);
-        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+        run_empty_frame(&ctx);
         for font_id in [
             egui::FontId::proportional(13.0),
             egui::FontId::proportional(34.0),

@@ -9563,6 +9563,20 @@ mod tests {
     use km003c_lib::{AdcQueueSample, packet::Attribute};
     use polars::prelude::{CsvReader, ParquetReader, SerReader};
 
+    /// Runs one headless egui pass for layout tests.
+    ///
+    /// No renderer uploads the font-atlas texture deltas here, so hand them back
+    /// explicitly; egui 0.36 debug-asserts when unapplied deltas are dropped.
+    fn run_test_frame(
+        ctx: &egui::Context,
+        input: egui::RawInput,
+        run_ui: impl FnMut(&mut egui::Ui),
+    ) -> egui::FullOutput {
+        let mut output = ctx.run_ui(input, run_ui);
+        output.textures_delta.clear();
+        output
+    }
+
     #[test]
     fn monitor_time_ticks_keep_long_labels_apart_without_losing_intermediate_marks() {
         for seconds in [2.0, 100.0, 3_600.0, 86_400.0] {
@@ -9779,7 +9793,7 @@ mod tests {
     fn form_rows_measure_multiline_controls_before_placing_the_next_row() {
         let ctx = egui::Context::default();
         for language in Language::ALL {
-            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let _ = run_test_frame(&ctx, egui::RawInput::default(), |ui| {
                 ui.set_width(580.0);
                 let form = SettingsFormMetrics::for_available_width(580.0);
                 let mut first_bounds = egui::Rect::NOTHING;
@@ -9877,7 +9891,8 @@ mod tests {
                 theme::apply(&ctx, SkinId::Industrial);
                 theme::install_fonts(&ctx);
                 for _ in 0..3 {
-                    let output = ctx.run_ui(
+                    let output = run_test_frame(
+                        &ctx,
                         egui::RawInput {
                             screen_rect: Some(screen),
                             ..Default::default()
@@ -9923,7 +9938,7 @@ mod tests {
     fn accumulated_readings_align_numbers_and_units_without_direction_drift() {
         let ctx = egui::Context::default();
         for width in [180.0, 218.0] {
-            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let output = run_test_frame(&ctx, egui::RawInput::default(), |ui| {
                 ui.set_width(width);
                 for (label, value) in [
                     ("Energy", "13.3686 Wh"),
@@ -9967,7 +9982,7 @@ mod tests {
     fn instrument_cards_keep_their_reserved_height_after_drawing_headers() {
         let ctx = egui::Context::default();
         for compact in [true, false] {
-            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let _ = run_test_frame(&ctx, egui::RawInput::default(), |ui| {
                 ui.set_width(if compact { 202.0 } else { 218.0 });
                 let start = ui.next_widget_position().y;
                 let card_height = if compact { 78.0 } else { 94.0 };
@@ -10006,7 +10021,7 @@ mod tests {
         for language in Language::ALL {
             app.language = language;
             for _ in 0..3 {
-                let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let _ = run_test_frame(&ctx, egui::RawInput::default(), |ui| {
                     let rect = egui::Rect::from_min_size(ui.next_widget_position(), egui::vec2(740.0, 580.0));
                     let mut chart = ui.new_child(
                         egui::UiBuilder::new()
@@ -10123,7 +10138,7 @@ mod tests {
             for mode in [ChartObservationMode::Overview, ChartObservationMode::Detail] {
                 app.chart_observation_mode = mode;
                 for _ in 0..3 {
-                    let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    let _ = run_test_frame(&ctx, egui::RawInput::default(), |ui| {
                         let rect = egui::Rect::from_min_size(ui.next_widget_position(), egui::vec2(740.0, 580.0));
                         let mut chart = ui.new_child(
                             egui::UiBuilder::new()
@@ -10162,7 +10177,8 @@ mod tests {
                 for page in SettingsPage::ALL {
                     app.settings_page = page;
                     for _ in 0..3 {
-                        let _ = ctx.run_ui(
+                        let _ = run_test_frame(
+                            &ctx,
                             egui::RawInput {
                                 screen_rect: Some(screen),
                                 ..Default::default()
@@ -10199,7 +10215,7 @@ mod tests {
             app.language = language;
             for page in SettingsPage::ALL {
                 app.settings_page = page;
-                let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let _ = run_test_frame(&ctx, egui::RawInput::default(), |ui| {
                     ui.set_width(600.0);
                     app.show_settings_content(ui);
                 });
