@@ -37,7 +37,7 @@ objc2 = "0.6.4"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSProcessInfo", "NSString"] }
 # Locating and mapping the Simplified Chinese system font (src/theme.rs). The
 # memmap feature lets fontdb read face names without loading a ~60 MB file.
-fontdb = { version = "0.23.0", default-features = false, features = ["std", "fs", "memmap"] }
+fontdb = { version = "0.24.0", default-features = false, features = ["std", "fs", "memmap"] }
 memmap2 = "0.9.11"
 # Rejects faces whose outlines egui cannot draw; already in the graph through fontdb.
 ttf-parser = { version = "0.25.1", default-features = false, features = ["std"] }
